@@ -1,0 +1,7 @@
+.venv/
+.browser_profile/
+.chrome_cdp/
+data/
+output/
+__pycache__/
+.claude/

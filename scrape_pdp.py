@@ -1,0 +1,434 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+scrape_pdp.py — เปิดหน้าสินค้าด้วย Playwright แล้วฉีด extract_pdp.js เข้าไปดึงข้อมูล
+ออกแบบให้รันบน Claude Code / Terminal (ต่างจาก Claude in Chrome ตรงที่ทำ batch + cron ได้)
+
+ติดตั้งครั้งแรก:
+    pip install playwright
+    playwright install chromium
+
+ล็อกอินครั้งแรก (จำเป็นสำหรับ Shopee — cookie จะถูกเก็บใน profile):
+    python scrape_pdp.py --login
+
+รันเก็บข้อมูล:
+    python scrape_pdp.py --urls urls.txt --out raw_2026-07-23.ndjson
+    python normalize_pdp.py --inputs raw_2026-07-23.ndjson --out Sales_Tracker_PDP_2026-07-23.xlsx
+
+หมายเหตุ: เขียนผลแบบ NDJSON ต่อท้ายทีละรายการ ถ้าหลุดกลางทางรันซ้ำได้ (--resume ข้าม URL ที่ทำแล้ว)
+"""
+
+import argparse
+import asyncio
+import json
+import os
+import random
+import re
+import sys
+import urllib.request
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from playwright.async_api import async_playwright
+
+TH = timezone(timedelta(hours=7))
+HERE = Path(__file__).resolve().parent
+JS_PATH = HERE / "extract_pdp.js"
+PROFILE = HERE / ".browser_profile"          # persistent profile เก็บ cookie/login
+
+# ไม่ override user-agent — UA ปลอมที่ไม่ตรงกับ OS/เบราว์เซอร์จริงทำให้ fingerprint ขัดกันเอง
+# แล้วโดน anti-bot จับง่ายกว่าเดิม ปล่อยให้ Chromium ส่ง UA ของตัวเองไป
+
+
+def load_js():
+    if not JS_PATH.exists():
+        sys.exit(f"ไม่พบ {JS_PATH} — ต้องวางไว้โฟลเดอร์เดียวกับสคริปต์นี้")
+    src = JS_PATH.read_text(encoding="utf-8").strip().rstrip(";")
+    # ห่อเป็น arrow function เพื่อให้ Playwright เรียกและ await ผลลัพธ์ให้แน่นอน
+    return "async () => { return await (%s); }" % src
+
+
+def read_urls(path):
+    urls = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            urls.append(line.split()[0])
+    return list(dict.fromkeys(urls))       # ตัดซ้ำ คงลำดับเดิม
+
+
+DEFAULT_CDP = "http://localhost:9222"
+
+
+def probe_cdp(url, timeout=1.5):
+    """มี Chrome เปิด debug port ค้างอยู่ไหม — ถ้ามีให้เกาะตัวนั้นแทนเปิดหน้าต่างใหม่"""
+    try:
+        with urllib.request.urlopen(url.rstrip("/") + "/json/version", timeout=timeout):
+            return url
+    except Exception:
+        return None
+
+
+def platform_of(url):
+    h = urlsplit(url).netloc
+    if "lazada." in h:
+        return "lazada"
+    if "shopee." in h:
+        return "shopee"
+    if "tiktok" in h:
+        return "tiktok"
+    return None
+
+
+def clean_url(url):
+    """ตัด query ของลิงก์แชร์จากแอปทิ้ง (enable_shop_tab_popup, share_*, utm_*, timestamp เก่า)
+    เหลือแค่ /view/product/<id> — พารามิเตอร์พวกนี้บอก TikTok ตรง ๆ ว่ามาจากการแชร์ ทำให้โดน CAPTCHA ง่ายขึ้น
+    ใช้เฉพาะตอน navigate ส่วน url_requested ยังเก็บลิงก์เดิมไว้ให้ --resume เทียบได้"""
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return url
+    if "tiktok.com" in u.netloc and "/product/" in u.path:
+        return urlunsplit((u.scheme, u.netloc, u.path, "", ""))
+    return url
+
+
+def done_urls(out_path):
+    seen = set()
+    p = Path(out_path)
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                seen.add(json.loads(line).get("url_requested"))
+            except Exception:
+                pass
+    seen.discard(None)
+    return seen
+
+
+# Lazada PDP ไม่มี sold รายสินค้า แต่หน้า search (catalog ajax) มี — ยิง fetch แบบ same-origin
+# บนหน้า PDP ที่โหลดอยู่แล้ว (same origin กับ /catalog) แล้ว match ด้วย nid (= product_id)
+LAZADA_SOLD_JS = r"""
+async ([queries, nid]) => {
+  const grab = (j) => {
+    const find = (o, d = 0) => {
+      if (!o || typeof o !== 'object' || d > 8) return null;
+      if (Array.isArray(o) && o.length && o[0] && (o[0].nid || o[0].itemId)) return o;
+      for (const k of Object.keys(o)) { const r = find(o[k], d + 1); if (r) return r; }
+      return null;
+    };
+    return find(j) || [];
+  };
+  // ลองหลาย query (ชื่อเต็ม -> แบรนด์+รหัสรุ่น -> รหัสรุ่น) หยุดทันทีที่เจอ nid
+  // ชื่อสินค้าบางตัวมีคำเยอะจนกลบรหัสรุ่น ค้นไม่ติดอันดับ ต้องลอง query ที่เจาะจงกว่าด้วย
+  for (const query of queries) {
+    for (let pg = 1; pg <= 3; pg++) {
+      const url = `/catalog/?ajax=true&page=${pg}&q=${encodeURIComponent(query)}`;
+      try {
+        const res = await fetch(url, { credentials: 'include', headers: { 'x-requested-with': 'XMLHttpRequest' } });
+        if (!res.ok) continue;
+        const items = grab(await res.json());
+        const hit = items.find(x => String(x.nid || x.itemId) === String(nid));
+        if (hit) return { found: true, sold: hit.itemSoldCntShow || null, query, page: pg };
+      } catch (e) { return { err: String(e).slice(0, 80) }; }
+    }
+  }
+  return { found: false, sold: null };
+}
+"""
+
+
+def _lazada_queries(name):
+    """สร้าง query หลายแบบเรียงจากกว้างไปเจาะจง ให้ search เจอ nid มากที่สุด:
+      1) ชื่อเต็ม (ตรงกับที่ Lazada index หัวข้อ)
+      2) แบรนด์ + รหัสรุ่น (เจาะจง เมื่อชื่อเต็มมีคำเยอะจนกลบ)
+      3) รหัสรุ่นล้วน (สำรอง)
+    รหัสรุ่น = token ที่มีทั้งตัวอักษร+ตัวเลข เช่น Osid-520, Scd-110"""
+    name = re.sub(r"[()\[\]|/]", " ", str(name or ""))
+    words = [w for w in name.split() if w]
+    if not words:
+        return [""]
+    full = " ".join(words[:12])
+    models = [w for w in words if re.search(r"[A-Za-z]", w) and re.search(r"\d", w) and len(w) >= 4]
+    brand = words[0]
+    queries = [full]
+    if models:
+        for q in (brand + " " + " ".join(models[:3]), " ".join(models[:2])):
+            q = q.strip()
+            if q and q not in queries:
+                queries.append(q)
+    return queries
+
+
+def parse_sold_show(s):
+    """'546 sold' -> (546, False) ; '2.0K sold' -> (2000, True) ; คืน (จำนวน, เป็นเลขกลมไหม)"""
+    if not s:
+        return None, False
+    m = re.search(r"([\d.,]+)\s*([KkMm]?)", str(s))
+    if not m:
+        return None, False
+    try:
+        n = float(m.group(1).replace(",", ""))
+    except ValueError:
+        return None, False
+    mult = {"k": 1e3, "m": 1e6}.get(m.group(2).lower(), 1)
+    approx = mult > 1                       # มี K/M = ถูกปัด ไม่เป๊ะ
+    return int(n * mult), approx
+
+
+async def enrich_lazada_sold(page, rec):
+    """เติม sold_count/sold_band ให้ record ของ Lazada จากหน้า search (เรียกตอนอยู่บนหน้า PDP)"""
+    pid = str(rec.get("product_id") or "")
+    if not pid or not rec.get("product_name"):
+        return
+    try:
+        r = await page.evaluate(LAZADA_SOLD_JS, [_lazada_queries(rec.get("product_name")), pid])
+    except Exception as e:
+        rec.setdefault("warnings", []).append(f"lazada sold: fetch พลาด ({str(e)[:60]})")
+        return
+    show = r.get("sold")
+    if not show:
+        if r.get("found"):
+            rec.setdefault("warnings", []).append("lazada sold: Lazada ไม่แสดงยอดขายสินค้านี้ (อาจขายน้อย/ใหม่)")
+        else:
+            rec.setdefault("warnings", []).append("lazada sold: หาใน search ไม่เจอ (อันดับเกินหน้า 3 / ชื่อไม่ตรง)")
+        return
+    n, approx = parse_sold_show(show)
+    rec["sold_band"] = show
+    rec["sold_count"] = n
+    if approx:
+        rec.setdefault("warnings", []).append(
+            "lazada sold เป็นเลขกลม (>1พัน Lazada ปัดเป็น K) — diff รายวันอาจไม่ละเอียด")
+
+
+async def wait_for_state(page, timeout_ms=8000):
+    """รอให้ state object โผล่ (บางหน้า hydrate ช้า) — ไม่ error ถ้าไม่มา ปล่อยให้ fallback DOM ทำงาน"""
+    try:
+        await page.wait_for_function(
+            """() => !!(window.__moduleData__ || window.__UNIVERSAL_DATA_FOR_REHYDRATION__
+                        || window.__MODERN_ROUTER_DATA__ || window.__INITIAL_STATE__
+                        || /shopee\\./.test(location.hostname))""",
+            timeout=timeout_ms,
+        )
+    except Exception:
+        pass
+
+
+async def scrape_one(page, url, js, retries=2, lazada_sold=False):
+    last_err = None
+    target = clean_url(url)
+    for attempt in range(retries + 1):
+        try:
+            await page.goto(target, wait_until="domcontentloaded", timeout=45000)
+            await wait_for_state(page)
+            await page.wait_for_timeout(1200)          # ให้ SPA render variation ให้เสร็จ
+            rec = await page.evaluate(js)
+            if isinstance(rec, dict):
+                rec["url_requested"] = url
+                rec["attempt"] = attempt + 1
+                # Lazada: เติมยอดขายจากหน้า search (ยังอยู่บนหน้า PDP = same-origin)
+                # ห้ามให้ error ตรงนี้ทำให้ record หลักพัง — เป็นแค่ข้อมูลเสริม
+                if lazada_sold and rec.get("platform") == "lazada" and not rec.get("error"):
+                    try:
+                        await enrich_lazada_sold(page, rec)
+                    except Exception as e:
+                        rec.setdefault("warnings", []).append(f"lazada sold: ข้ามเพราะ error ({str(e)[:50]})")
+                return rec
+            last_err = "extractor ไม่คืน object"
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+        await asyncio.sleep(2 + attempt * 3)
+    return {"error": last_err, "url_requested": url, "url": url,
+            "scraped_at": datetime.now(TH).isoformat()}
+
+
+def unusable_reason(url):
+    """ลิงก์ที่เปิดไม่ได้แน่ ๆ — ข้ามเลย ไม่ต้องเสียเวลาเปิด (คืนเหตุผล หรือ None ถ้าใช้ได้)"""
+    u = (url or "").strip()
+    if not u:
+        return "ไม่มีลิงก์"
+    if "/search" in u or "keyword=" in u:
+        return "ลิงก์ค้นหา ไม่ใช่หน้าสินค้า"
+    return None
+
+
+def load_skip_set(path):
+    """รายชื่อลิงก์ตายที่ยืนยันแล้ว (data/dead_links.txt) — ข้ามถาวร"""
+    s = set()
+    if path and os.path.exists(path):
+        for line in Path(path).read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                s.add(line)
+    return s
+
+
+async def scrape_loop(page, urls, js, args):
+    """วนเก็บทีละ URL เขียน NDJSON ต่อท้าย — ใช้ร่วมกันทั้งโหมด launch เองและโหมด --cdp"""
+    out = open(args.out, "a", encoding="utf-8") if args.out else None
+    skip_set = load_skip_set(getattr(args, "skip_dead", None))
+    ok = fail = skipped = 0
+    try:
+        for i, url in enumerate(urls, 1):
+            # ลิงก์เปิดไม่ได้ / ตายแล้ว -> ใส่ record blocked (= Null + เหตุผล) ไม่เปิดหน้า ไม่เสียเวลา
+            dead = unusable_reason(url) or ("อยู่ในรายชื่อลิงก์ตาย (dead_links)" if url in skip_set else None)
+            if dead:
+                skipped += 1
+                rec = {"source": "blocked", "platform": platform_of(url),
+                       "url_requested": url, "url": url,
+                       "warnings": [f"ข้ามไม่สแกน: {dead}"],
+                       "scraped_at": datetime.now(TH).isoformat()}
+                print(f"[{i}/{len(urls)}] SKIP {dead}", file=sys.stderr)
+                if out:
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n"); out.flush()
+                else:
+                    print(json.dumps(rec, ensure_ascii=False))
+                continue
+
+            rec = await scrape_one(page, url, js, retries=args.retries,
+                                   lazada_sold=getattr(args, "lazada_sold", False))
+            if rec.get("error") or not rec.get("product_name"):
+                fail += 1
+                reason = rec.get("error") or (rec.get("warnings") or ["ไม่พบชื่อสินค้า"])[0]
+                status = "FAIL " + str(reason)[:70]
+            else:
+                ok += 1
+                status = f"OK   {rec.get('source')} | {str(rec.get('product_name'))[:40]}"
+            print(f"[{i}/{len(urls)}] {status}", file=sys.stderr)
+
+            line = json.dumps(rec, ensure_ascii=False)
+            if out:
+                out.write(line + "\n")
+                out.flush()
+            else:
+                print(line)
+
+            if i < len(urls):
+                await asyncio.sleep(random.uniform(args.delay, args.delay * 1.8))
+    finally:
+        if out:
+            out.close()
+
+    print(json.dumps({"total": len(urls), "ok": ok, "fail": fail, "skipped": skipped, "out": args.out},
+                     ensure_ascii=False), file=sys.stderr)
+
+
+async def run(args):
+    js = load_js()
+    urls = read_urls(args.urls) if args.urls else []
+    if args.platform:
+        before = len(urls)
+        urls = [u for u in urls if platform_of(u) == args.platform]
+        print(f"[platform] ทำเฉพาะ {args.platform}: {len(urls)}/{before} URL", file=sys.stderr)
+    if args.resume and args.out:
+        skip = done_urls(args.out)
+        before = len(urls)
+        urls = [u for u in urls if u not in skip]
+        print(f"[resume] ข้าม {before - len(urls)} URL ที่ทำไปแล้ว", file=sys.stderr)
+
+    PROFILE.mkdir(exist_ok=True)
+    async with async_playwright() as pw:
+        # ---- โหมด CDP: เกาะ Chrome ที่ผู้ใช้เปิดค้างไว้เอง (ผ่าน CAPTCHA/ล็อกอินมาแล้วด้วยมือ) ----
+        # เบราว์เซอร์ตัวนี้ผู้ใช้เป็นคนเปิด anti-bot จึงไม่เห็นร่องรอย automation แบบ launch เอง
+        # --login ต้องเปิดหน้าต่างใหม่เสมอ (จุดประสงค์คือไปล็อกอิน) จึงไม่ auto-detect
+        cdp = args.cdp
+        if not cdp and not args.no_cdp and not args.login:
+            cdp = probe_cdp(DEFAULT_CDP)
+            if cdp:
+                print(f"[cdp] เจอ Chrome เปิดอยู่ที่ {cdp} — ใช้ตัวนั้น (ไม่เปิดหน้าต่างใหม่)", file=sys.stderr)
+
+        if cdp:
+            browser = await pw.chromium.connect_over_cdp(cdp)
+            if not browser.contexts:
+                sys.exit(f"ต่อ {cdp} ได้ แต่ไม่พบ context — เปิดแท็บใน Chrome ก่อน")
+            ctx = browser.contexts[0]
+            page = await ctx.new_page()
+            print(f"[cdp] เกาะ Chrome ที่ {cdp} แล้ว ({len(ctx.pages)} แท็บ)", file=sys.stderr)
+            try:
+                await scrape_loop(page, urls, js, args)
+            finally:
+                await page.close()          # ปิดแค่แท็บที่เราเปิด ไม่แตะเบราว์เซอร์ของผู้ใช้
+            return
+
+        opts = dict(
+            user_data_dir=str(PROFILE),
+            headless=args.headless,
+            locale="th-TH",
+            timezone_id="Asia/Bangkok",
+            viewport={"width": 1440, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        # Chrome ตัวจริงมีร่องรอยต่างจาก Chromium ที่ Playwright bundle มา (codec, build flags, brand)
+        # anti-bot ของ TikTok ดูจุดพวกนี้ — ถ้าเครื่องมี Chrome ให้ใช้ตัวจริงก่อน
+        try:
+            ctx = await pw.chromium.launch_persistent_context(channel=args.channel, **opts)
+        except Exception as e:
+            if args.channel == "chromium":
+                raise
+            print(f"[warn] เปิด channel={args.channel} ไม่ได้ ({e}) — ถอยไปใช้ chromium", file=sys.stderr)
+            ctx = await pw.chromium.launch_persistent_context(**opts)
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        if args.login:
+            want = args.platform            # None = เปิดให้ครบทุกแพลตฟอร์ม
+            tabs = []
+            if want in (None, "shopee"):
+                tabs.append(("Shopee", "https://shopee.co.th/buyer/login",
+                             "ล็อกอินให้เรียบร้อย (ต้องมี cookie ถึงจะเรียก API ได้)"))
+            if want in (None, "tiktok"):
+                tabs.append(("TikTok", next((clean_url(u) for u in urls if platform_of(u) == "tiktok"),
+                                            "https://www.tiktok.com/shop"),
+                             "ถ้าเจอ Security Check ให้ลากจิ๊กซอว์ผ่านเอง แล้วรอจนเห็นหน้าสินค้า"))
+
+            print(f"เปิดเบราว์เซอร์แล้ว — ทำให้ครบ {len(tabs)} แท็บ:")
+            for i, (name, url, how) in enumerate(tabs, 1):
+                print(f"  แท็บ {i} {name}: {how}")
+                p = page if i == 1 else await ctx.new_page()
+                try:
+                    await p.goto(url, wait_until="domcontentloaded", timeout=45000)
+                except Exception as e:
+                    print(f"[warn] เปิดแท็บ {name} ไม่สำเร็จ: {e}", file=sys.stderr)
+            print("เสร็จแล้วกด Enter ในเทอร์มินัลนี้เพื่อบันทึก session")
+            await asyncio.to_thread(input)
+            await ctx.close()
+            print(f"บันทึก profile ไว้ที่ {PROFILE}")
+            return
+
+        try:
+            await scrape_loop(page, urls, js, args)
+        finally:
+            await ctx.close()
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--urls", help="ไฟล์ .txt ลิงก์สินค้า บรรทัดละ 1 ลิงก์ (# = คอมเมนต์)")
+    ap.add_argument("--out", help="ไฟล์ .ndjson ปลายทาง (ไม่ใส่ = พิมพ์ออก stdout)")
+    ap.add_argument("--login", action="store_true", help="เปิดเบราว์เซอร์ให้ล็อกอินครั้งแรก")
+    ap.add_argument("--headless", action="store_true", help="รันแบบไม่มีหน้าต่าง (โดนตรวจจับง่ายกว่า)")
+    ap.add_argument("--resume", action="store_true", help="ข้าม URL ที่มีอยู่แล้วในไฟล์ --out")
+    ap.add_argument("--platform", choices=["lazada", "shopee", "tiktok"],
+                    help="ทำเฉพาะแพลตฟอร์มนี้ (ใช้กับ --login ด้วย = เปิดแค่แท็บนั้น)")
+    ap.add_argument("--channel", default="chrome", choices=["chrome", "msedge", "chromium"],
+                    help="เบราว์เซอร์ที่ใช้ (default chrome = Chrome ตัวจริง โดนตรวจจับน้อยกว่า)")
+    ap.add_argument("--cdp", nargs="?", const=DEFAULT_CDP, default=None,
+                    help=f"เกาะ Chrome ที่เปิดค้างไว้เอง (default {DEFAULT_CDP}) "
+                         "ใช้เมื่อ TikTok บังคับ CAPTCHA — ผู้ใช้กดผ่านเอง แล้วสคริปต์ทำงานบนแท็บนั้น "
+                         "ถ้าไม่ใส่ จะตรวจให้อัตโนมัติว่ามี Chrome เปิดอยู่ไหม")
+    ap.add_argument("--no-cdp", action="store_true",
+                    help="บังคับเปิดเบราว์เซอร์ใหม่ ไม่เกาะตัวที่เปิดอยู่")
+    ap.add_argument("--lazada-sold", action="store_true",
+                    help="เติมยอดขาย Lazada จากหน้า search (PDP ไม่มี) — ช้าขึ้นเล็กน้อย, sold เกิน 1พันเป็นเลขกลม")
+    ap.add_argument("--skip-dead", default="data/dead_links.txt",
+                    help="ไฟล์รายชื่อลิงก์ตายที่ข้ามถาวร (สร้างด้วย build_deadlist.py)")
+    ap.add_argument("--delay", type=float, default=4.0, help="หน่วงระหว่างสินค้า (วินาที, default 4)")
+    ap.add_argument("--retries", type=int, default=2)
+    args = ap.parse_args()
+    if not args.login and not args.urls:
+        ap.error("ต้องใส่ --urls หรือ --login")
+    asyncio.run(run(args))
+
+
+if __name__ == "__main__":
+    main()
