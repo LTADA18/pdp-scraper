@@ -126,7 +126,12 @@ async ([queries, nid]) => {
     for (let pg = 1; pg <= 3; pg++) {
       const url = `/catalog/?ajax=true&page=${pg}&q=${encodeURIComponent(query)}`;
       try {
-        const res = await fetch(url, { credentials: 'include', headers: { 'x-requested-with': 'XMLHttpRequest' } });
+        // กัน fetch ค้าง (Lazada โดน CAPTCHA อาจไม่ตอบ) — abort ใน 8 วิ
+        const ctrl = new AbortController();
+        const to = setTimeout(() => ctrl.abort(), 8000);
+        let res;
+        try { res = await fetch(url, { credentials: 'include', headers: { 'x-requested-with': 'XMLHttpRequest' }, signal: ctrl.signal }); }
+        finally { clearTimeout(to); }
         if (!res.ok) continue;
         const items = grab(await res.json());
         const hit = items.find(x => String(x.nid || x.itemId) === String(nid));
@@ -183,9 +188,12 @@ async def enrich_lazada_sold(page, rec):
     if not pid or not rec.get("product_name"):
         return
     try:
-        r = await page.evaluate(LAZADA_SOLD_JS, [_lazada_queries(rec.get("product_name")), pid])
+        # asyncio.wait_for = กันแข็ง: ถ้า page.evaluate/fetch ค้าง (โดน CAPTCHA) ให้ยอมแพ้ใน 30 วิ ไม่ค้างทั้งคืน
+        r = await asyncio.wait_for(
+            page.evaluate(LAZADA_SOLD_JS, [_lazada_queries(rec.get("product_name")), pid]),
+            timeout=30)
     except Exception as e:
-        rec.setdefault("warnings", []).append(f"lazada sold: fetch พลาด ({str(e)[:60]})")
+        rec.setdefault("warnings", []).append(f"lazada sold: fetch พลาด/timeout ({str(e)[:60]})")
         return
     show = r.get("sold")
     if not show:
@@ -264,11 +272,61 @@ def load_skip_set(path):
     return s
 
 
+# จับเฉพาะ CAPTCHA/Security Check "จริง" ที่รอผ่านได้ — ไม่รวม anti-bot patch (__ac_intercepted)
+# เพราะหน้า "สินค้าไม่พร้อมใช้งาน"/ลิงก์ตาย ก็มี __ac_intercepted ติดมาด้วย ถ้านับเป็น CAPTCHA จะพักยาวฟรีกับลิงก์ตาย
+_CAPTCHA_RE = re.compile(r"Security Check|CAPTCHA|ยืนยันตัวตน|ลากชิ้นส่วน|verify to continue|drag the puzzle", re.I)
+
+
+def is_security_check(rec):
+    """True เฉพาะ 'Security Check/CAPTCHA จริงบนหน้าสินค้า' ที่รอผ่านได้
+    — ไม่นับลิงก์เด้ง homepage (นั่น = ตายจริง จะได้ไม่ไปเสียเวลาคูลดาวน์กับลิงก์ตาย)"""
+    final = str(rec.get("url") or "")
+    if re.search(r"tiktok\.com", final, re.I) and not re.search(r"/pdp/|/view/product/|/product/", final, re.I):
+        return False
+    txt = " ".join([str(rec.get("error") or "")] + [str(w) for w in (rec.get("warnings") or [])])
+    return bool(_CAPTCHA_RE.search(txt))
+
+
+def alert_beep():
+    """เสียงเตือน (เผื่อมีคนอยู่หน้าจอ) — เงียบไปเองถ้าเครื่องไม่รองรับ"""
+    try:
+        sys.stderr.write("\a"); sys.stderr.flush()
+    except Exception:
+        pass
+    try:
+        import winsound
+        winsound.Beep(880, 300)
+    except Exception:
+        pass
+
+
+async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
+    """เจอ Security Check:
+    - ถ้าเป็นตัวโดดๆ (session ยังไม่พัง) -> ลองซ้ำสั้น ๆ เผื่อ transient
+    - ถ้ากำลังโดนถล่มติดกัน (in_streak) -> ไม่ลองซ้ำ (ลองไปก็ CAPTCHA) คืนเลย
+      ให้ตัวนับ streak ข้างนอกสั่ง 'พักยาวทีเดียว' รีเซ็ต session แทน — throughput ดีกว่า
+    ไม่มีการตีเป็นลิงก์ตาย: ที่ยังไม่ผ่าน = ไปกองเก็บซ้ำ"""
+    alert_beep()
+    if in_streak:
+        return orig
+    rec = orig
+    for k in range(1, args.captcha_retries + 1):
+        print(f"[{i}/{n}] Security Check — พัก {args.captcha_cooldown:.0f}s แล้วลองใหม่ (รอบ {k}/{args.captcha_retries}) "
+              f"[ถ้าอยู่หน้าจอ ลากจิ๊กซอว์ผ่านได้เลย]", file=sys.stderr)
+        await asyncio.sleep(args.captcha_cooldown)
+        rec = await scrape_one(page, url, js, retries=1, lazada_sold=False)
+        if not is_security_check(rec) and rec.get("product_name"):
+            print(f"[{i}/{n}] ✓ ผ่าน Security Check แล้ว", file=sys.stderr)
+            return rec
+    return rec
+
+
 async def scrape_loop(page, urls, js, args):
     """วนเก็บทีละ URL เขียน NDJSON ต่อท้าย — ใช้ร่วมกันทั้งโหมด launch เองและโหมด --cdp"""
     out = open(args.out, "a", encoding="utf-8") if args.out else None
     skip_set = load_skip_set(getattr(args, "skip_dead", None))
     ok = fail = skipped = 0
+    consec_captcha = 0
     try:
         for i, url in enumerate(urls, 1):
             # ลิงก์เปิดไม่ได้ / ตายแล้ว -> ใส่ record blocked (= Null + เหตุผล) ไม่เปิดหน้า ไม่เสียเวลา
@@ -288,6 +346,11 @@ async def scrape_loop(page, urls, js, args):
 
             rec = await scrape_one(page, url, js, retries=args.retries,
                                    lazada_sold=getattr(args, "lazada_sold", False))
+            # TikTok เจอ Security Check -> คูลดาวน์+ลองใหม่เอง (รันข้ามคืนไม่ต้องมีคน)
+            if is_security_check(rec):
+                rec = await handle_security_check(page, url, js, args, i, len(urls),
+                                                  consec_captcha >= 1, rec)
+
             if rec.get("error") or not rec.get("product_name"):
                 fail += 1
                 reason = rec.get("error") or (rec.get("warnings") or ["ไม่พบชื่อสินค้า"])[0]
@@ -304,7 +367,25 @@ async def scrape_loop(page, urls, js, args):
             else:
                 print(line)
 
+            # ยัง Security Check อยู่หลังคูลดาวน์ = อาจโดนแบน session ยาว -> พักก้อนใหญ่ให้รีเซ็ต
+            if is_security_check(rec):
+                consec_captcha += 1
+                if args.platform in ("tiktok", "lazada") and consec_captcha >= args.captcha_streak:
+                    print(f"[captcha] โดนติดกัน {consec_captcha} ตัว — พักยาว {args.long_cooldown:.0f}s ให้ session รีเซ็ต",
+                          file=sys.stderr)
+                    alert_beep()
+                    await asyncio.sleep(args.long_cooldown)
+                    consec_captcha = 0
+            else:
+                consec_captcha = 0
+
             if i < len(urls):
+                # พักเบรกเป็นก้อนทุก ๆ N ตัว (เฉพาะ tiktok) กัน CAPTCHA สะสม — ตัวการหลักตาม CLAUDE.md
+                if (args.platform in ("tiktok", "lazada") and args.batch_cooldown > 0
+                        and args.batch_size > 0 and i % args.batch_size == 0):
+                    print(f"[batch] ครบ {args.batch_size} ตัว — พักเบรก {args.batch_cooldown:.0f}s กัน CAPTCHA สะสม",
+                          file=sys.stderr)
+                    await asyncio.sleep(args.batch_cooldown)
                 await asyncio.sleep(random.uniform(args.delay, args.delay * 1.8))
     finally:
         if out:
@@ -424,6 +505,19 @@ def main():
                     help="ไฟล์รายชื่อลิงก์ตายที่ข้ามถาวร (สร้างด้วย build_deadlist.py)")
     ap.add_argument("--delay", type=float, default=4.0, help="หน่วงระหว่างสินค้า (วินาที, default 4)")
     ap.add_argument("--retries", type=int, default=2)
+    # --- กัน/กู้ CAPTCHA ของ TikTok (รันข้ามคืนไม่ต้องมีคน) ---
+    ap.add_argument("--captcha-cooldown", type=float, default=60.0,
+                    help="เจอ Security Check ตัวโดดๆ: พักกี่วินาทีก่อนลองซ้ำ (default 60)")
+    ap.add_argument("--captcha-retries", type=int, default=1,
+                    help="ลองซ้ำ Security Check ตัวโดดๆ กี่รอบ (default 1)")
+    ap.add_argument("--captcha-streak", type=int, default=3,
+                    help="โดน CAPTCHA ติดกันกี่ตัว = session พัง -> พักยาว (default 3)")
+    ap.add_argument("--long-cooldown", type=float, default=600.0,
+                    help="พักยาวรีเซ็ต session เมื่อโดนถล่มติดกัน (วินาที, default 600=10นาที)")
+    ap.add_argument("--batch-size", type=int, default=40,
+                    help="พักเบรกทุก ๆ กี่ตัว เฉพาะ tiktok (default 40)")
+    ap.add_argument("--batch-cooldown", type=float, default=90.0,
+                    help="ความยาวเบรกแต่ละก้อน วินาที (0=ปิด, default 90)")
     args = ap.parse_args()
     if not args.login and not args.urls:
         ap.error("ต้องใส่ --urls หรือ --login")

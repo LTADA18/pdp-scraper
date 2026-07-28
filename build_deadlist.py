@@ -18,7 +18,8 @@ from pathlib import Path
 
 # เหตุผลที่ถือว่าตายถาวร (regex บน note/error)
 DEAD_PATTERNS = re.compile(
-    r"ถูกลบ|no longer available|product is no longer|ไม่พร้อมจำหน่าย|"
+    r"ถูกลบ|no longer available|product is no longer|ไม่พร้อมจำหน่าย|ไม่พร้อมใช้งาน|"
+    r"not available in this (country|region)|"
     r"404|ไม่ใช่หน้าสินค้า|ลิงก์ค้นหา|อ่าน shop_id/item_id",
     re.I)
 # CAPTCHA = ไม่ตาย (ลองใหม่ได้) อย่าเพิ่งใส่ deadlist
@@ -45,7 +46,15 @@ def main():
                 url = r.get("url_requested") or r.get("url")
                 if not url:
                     continue
+                final = str(r.get("url") or "")     # ปลายทางจริงหลัง redirect (ลิงก์สั้นคลายแล้ว)
                 text = " ".join([str(r.get("error") or "")] + [str(w) for w in (r.get("warnings") or [])])
+                # TikTok เด้งออกจากหน้าสินค้า -> หน้าแรก/วิดีโอ = ตายจริง (ลิงก์ไม่พาไปหน้าร้านแล้ว)
+                # เช็คก่อน ALIVE_PATTERNS เพราะหน้าแรกก็มี anti-bot แต่ประเด็นคือ "ไม่มีสินค้าตรงนั้น"
+                if (re.search(r"tiktok\.com", final, re.I)
+                        and not re.search(r"/pdp/|/view/product/|/product/", final, re.I)
+                        and not r.get("product_name")):
+                    dead[url] = "เด้งหน้าแรก (ไม่ใช่หน้าร้าน)"
+                    continue
                 if ALIVE_PATTERNS.search(text):        # CAPTCHA ฯลฯ — ข้าม ไม่ใส่ deadlist
                     continue
                 # /search โดยตรง หรือ note บอกว่าตาย
