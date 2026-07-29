@@ -18,11 +18,19 @@ from pathlib import Path
 
 # เหตุผลที่ถือว่าตายถาวร (regex บน note/error)
 DEAD_PATTERNS = re.compile(
-    r"ถูกลบ|no longer available|product is no longer|ไม่พร้อมจำหน่าย|"
+    r"ถูกลบ|no longer available|product is no longer|ไม่พร้อมจำหน่าย|ไม่พร้อมใช้งาน|"
+    r"not available in this (country|region)|"
     r"404|ไม่ใช่หน้าสินค้า|ลิงก์ค้นหา|อ่าน shop_id/item_id",
     re.I)
 # CAPTCHA = ไม่ตาย (ลองใหม่ได้) อย่าเพิ่งใส่ deadlist
 ALIVE_PATTERNS = re.compile(r"CAPTCHA|Security Check|anti-bot", re.I)
+
+# url ปลายทางเป็น "หน้าสินค้า" จริงไหม (ทุกแพลตฟอร์ม)
+PRODUCT_URL = re.compile(
+    r"-i\d{6,}"                          # lazada  ...-i1234567890
+    r"|i\.\d+\.\d+|/product/\d+/\d+"     # shopee  i.shop.item / /product/shop/item
+    r"|/pdp/|/view/product/\d+|/product/\d{6,}",   # tiktok  /pdp/.. /view/product/..
+    re.I)
 
 
 def main():
@@ -45,7 +53,14 @@ def main():
                 url = r.get("url_requested") or r.get("url")
                 if not url:
                     continue
+                final = str(r.get("url") or "")     # ปลายทางจริงหลัง redirect (ลิงก์สั้นคลายแล้ว)
                 text = " ".join([str(r.get("error") or "")] + [str(w) for w in (r.get("warnings") or [])])
+                # เปิดลิงก์ได้ แต่ปลายทางไม่ใช่หน้าสินค้า (เด้งหน้าแรก/ไลฟ์/แคมเปญ) = ตายทุกแพลตฟอร์ม
+                # เช็คก่อน ALIVE_PATTERNS เพราะหน้าที่เด้งไปก็มี anti-bot ได้ แต่ประเด็นคือ "ลิงก์ไม่พาไปหน้าสินค้าแล้ว"
+                # หมายเหตุ: ถ้าปลายทางยังเป็น url สินค้าอยู่แต่ไม่มีชื่อ = อาจ CAPTCHA/hydrate ช้า -> ไม่ตี ตาย (retry ได้)
+                if final.startswith("http") and not PRODUCT_URL.search(final) and not r.get("product_name"):
+                    dead[url] = "ปลายทางไม่ใช่หน้าสินค้า"
+                    continue
                 if ALIVE_PATTERNS.search(text):        # CAPTCHA ฯลฯ — ข้าม ไม่ใส่ deadlist
                     continue
                 # /search โดยตรง หรือ note บอกว่าตาย
