@@ -76,12 +76,16 @@
   // ตรวจว่าที่โหลดมาเป็นหน้า anti-bot / CAPTCHA แทนหน้าสินค้า (TikTok เจอบ่อยสุด)
   const captchaReason = () => {
     const title = document.title || '';
-    if (/security check|captcha|ยืนยันตัวตน/i.test(title)) return 'หน้า anti-bot: "' + title + '"';
-    if (document.querySelector('#captcha-verify-image, .captcha_verify_container, [class*="captcha_verify"], [id^="captcha"]'))
+    if (/security check|captcha|ยืนยันตัวตน|punish/i.test(title)) return 'หน้า anti-bot: "' + title + '"';
+    // element: TikTok captcha + Lazada/Alibaba slider (nc_) + Google reCAPTCHA
+    if (document.querySelector('#captcha-verify-image, .captcha_verify_container, [class*="captcha_verify"], [id^="captcha"], .nc_iconfont, .nc-lang-cnt, [id*="nc_1_"], [class*="slidecaptcha"], [class*="nocaptcha"], .g-recaptcha, [class*="g-recaptcha"], iframe[src*="recaptcha"]'))
       return 'พบ CAPTCHA element ในหน้า';
     const body = ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').trim();
-    if (body.length < 400 && /verify to continue|drag the puzzle|ลากชิ้นส่วน|ยืนยันเพื่อดำเนินการต่อ/i.test(body))
-      return 'หน้ายืนยันตัวตน: "' + body.slice(0, 80) + '"';
+    // ข้อความ reCAPTCHA เจาะจง (ตามที่ Lazada เด้ง) — ไม่จำกัดความยาว body
+    if (/ตรวจสอบว่าคุณเป็นหุ่นยนต์|ไม่ใช่โปรแกรมอัตโนมัติ|เป็นหุ่นยนต์หรือไม่|i'?m not a robot|recaptcha/i.test(body))
+      return 'หน้า reCAPTCHA (ยืนยันไม่ใช่บอท)';
+    if (body.length < 600 && /verify to continue|drag the puzzle|ลากชิ้นส่วน|ยืนยันเพื่อดำเนินการต่อ|slide to verify|เลื่อนเพื่อยืนยัน|please slide/i.test(body))
+      return 'หน้ายืนยันตัวตน (slider): "' + body.slice(0, 80) + '"';
     return null;
   };
 
@@ -129,6 +133,16 @@
     r.platform = 'lazada';
     const mid = location.href.match(/-i(\d+)(?:-s(\d+))?\.html/);
     r.product_id = mid ? mid[1] : null;
+
+    // โดน CAPTCHA/slider ของ Lazada = ไม่มี state ให้แกะ ตรวจก่อน ไม่งั้นจะนึกว่า schema เปลี่ยน/สินค้าถูกลบ
+    if (!window.__moduleData__) {
+      const lzBlocked = captchaReason();
+      if (lzBlocked) {
+        r.source = 'blocked';
+        r.warnings.push('lazada: ' + lzBlocked + ' — โดน CAPTCHA (พัก/ผ่านเองก่อน)');
+        return r;
+      }
+    }
 
     const md = window.__moduleData__ || window.__INITIAL_STATE__ || null;
     const f = md && deepFind(md, o => o.product && (o.skuBase || o.skuInfos));
@@ -349,6 +363,13 @@
       r.sold_count = num(item.historical_sold ?? item.global_sold ?? item.sold);
       r.sold_band = item.historical_sold_display || (r.sold_count != null ? String(r.sold_count) : null);
       if (r.sold_count === null) r.warnings.push('shopee: API ไม่มี historical_sold — ตรวจ endpoint');
+    } else if (/ไม่พบสินค้า|product not found|page not found|no longer|ไม่พร้อมจำหน่าย/i
+                 .test(((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 500))) {
+      // หน้าโหลดได้แต่ขึ้น "ไม่พบสินค้า" = สินค้าถูกลบ (Shopee ไม่ redirect url ยังเป็นหน้าสินค้า)
+      // แยกจาก "API ไม่ตอบ" (anti-bot) ที่ลองใหม่ได้ — อันนี้ตายจริง ใส่ deadlist ได้
+      r.source = 'blocked';
+      r.warnings.push('shopee: สินค้าถูกลบ/ไม่พบสินค้า (หน้าโหลดได้แต่ไม่มีสินค้า)');
+      return r;
     } else {
       r.source = 'dom';
       r.warnings.push('shopee: API ไม่ตอบ (อาจโดน anti-bot) — fallback DOM/JSON-LD');
@@ -379,6 +400,13 @@
     if (blocked) {
       r.source = 'blocked';
       r.warnings.push('tiktok: ' + blocked + ' — ต้องผ่าน CAPTCHA เองก่อนด้วย scrape_pdp.py --login');
+      return r;
+    }
+    // หน้า /pdp/ โหลดได้จริง แต่ขึ้น empty state "สินค้าไม่พร้อมใช้งาน" = ถูกลบ/ปิดการขาย (ไม่ใช่ CAPTCHA) -> ตี dead
+    const naBody = ((document.body && document.body.innerText) || '');
+    if (/สินค้าไม่พร้อมใช้งาน|ไม่พร้อมใช้งานในประเทศหรือภูมิภาค|not available in this (country|region)/i.test(naBody)) {
+      r.source = 'blocked';
+      r.warnings.push('tiktok: สินค้าไม่พร้อมใช้งานในภูมิภาคนี้ — สินค้าถูกลบ/ปิดการขาย');
       return r;
     }
     if (window.__ac_intercepted_fetch || window.__ac_intercepted_open) {

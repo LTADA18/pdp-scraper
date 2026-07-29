@@ -19,8 +19,8 @@ $RAW  = "data\raw_$DATE.ndjson"
 $OUT  = "output\Sales_Tracker_PDP_$DATE.xlsx"
 New-Item -ItemType Directory -Force -Path data, output | Out-Null
 
-# TikTok ไวต่อการยิงถี่มาก (เทสต์ 300: delay 8 ผ่านแค่ 35%) ถ่างเป็น 15 วินาที ที่เหลือ 4 (ห้ามต่ำกว่า 3 — กฎเหล็กข้อ 3)
-if ($Delay -le 0) { $Delay = if ($Platform -eq "tiktok") { 15 } else { 4 } }
+# TikTok ไวต่อการยิงถี่มาก (เทสต์ 300: delay 8 ผ่านแค่ 35%) ถ่างเป็น 15 วินาที Lazada/Shopee 10 (ห้ามต่ำกว่า 3 — กฎเหล็กข้อ 3)
+if ($Delay -le 0) { $Delay = if ($Platform -eq "tiktok") { 15 } else { 10 } }
 
 $ARGS_ = @("--urls","urls.txt","--out",$RAW,"--delay","$Delay")
 if ($Resume)   { $ARGS_ += "--resume" }
