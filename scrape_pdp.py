@@ -287,17 +287,25 @@ def is_security_check(rec):
     return bool(_CAPTCHA_RE.search(txt))
 
 
-def alert_beep():
-    """เสียงเตือน (เผื่อมีคนอยู่หน้าจอ) — เงียบไปเองถ้าเครื่องไม่รองรับ"""
-    try:
-        sys.stderr.write("\a"); sys.stderr.flush()
-    except Exception:
-        pass
-    try:
-        import winsound
-        winsound.Beep(880, 300)
-    except Exception:
-        pass
+def alert_beep(times=1):
+    """เสียงเตือน (เผื่อมีคนอยู่หน้าจอ) — เงียบไปเองถ้าเครื่องไม่รองรับ
+    times = จำนวนครั้งที่บี๊บ (2 = เตือนหนัก ตอน CAPTCHA ค้างนานเกินกำหนด ต้องมีคนมาลาก)"""
+    for j in range(max(1, times)):
+        try:
+            sys.stderr.write("\a"); sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            import winsound
+            winsound.Beep(880, 300)
+        except Exception:
+            pass
+        if j < times - 1:
+            try:
+                import time
+                time.sleep(0.25)   # เว้นจังหวะให้ได้ยินเป็น 2 ที ชัด ๆ
+            except Exception:
+                pass
 
 
 async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
@@ -371,9 +379,10 @@ async def scrape_loop(page, urls, js, args):
             if is_security_check(rec):
                 consec_captcha += 1
                 if args.platform in ("tiktok", "lazada") and consec_captcha >= args.captcha_streak:
-                    print(f"[captcha] โดนติดกัน {consec_captcha} ตัว — พักยาว {args.long_cooldown:.0f}s ให้ session รีเซ็ต",
+                    print(f"[captcha] โดนติดกัน {consec_captcha} ตัว (เกินกำหนด {args.captcha_streak}) "
+                          f"— บี๊บ 2 ที เรียกคนมาลาก แล้วพักยาว {args.long_cooldown:.0f}s ให้ session รีเซ็ต",
                           file=sys.stderr)
-                    alert_beep()
+                    alert_beep(2)   # ค้างนานเกินกำหนด = เตือนหนัก 2 ที
                     await asyncio.sleep(args.long_cooldown)
                     consec_captcha = 0
             else:
