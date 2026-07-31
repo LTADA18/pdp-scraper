@@ -308,24 +308,62 @@ def alert_beep(times=1):
                 pass
 
 
+async def read_current_page(page, url, js):
+    """อ่านข้อมูลจากหน้าที่เปิดค้างอยู่ *โดยไม่ goto ใหม่*
+    — สำคัญ: ถ้า reload จะไปล้าง CAPTCHA ที่คนกำลังลากอยู่ ต้องอ่านหน้าเดิมเท่านั้น"""
+    try:
+        await wait_for_state(page, timeout_ms=3000)
+        rec = await page.evaluate(js)
+        if isinstance(rec, dict):
+            rec["url_requested"] = url
+            return rec
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "url_requested": url, "url": url,
+                "scraped_at": datetime.now(TH).isoformat()}
+    return orig_none_rec(url)
+
+
+def orig_none_rec(url):
+    return {"error": "extractor ไม่คืน object", "url_requested": url, "url": url,
+            "scraped_at": datetime.now(TH).isoformat()}
+
+
 async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
-    """เจอ Security Check:
-    - ถ้าเป็นตัวโดดๆ (session ยังไม่พัง) -> ลองซ้ำสั้น ๆ เผื่อ transient
-    - ถ้ากำลังโดนถล่มติดกัน (in_streak) -> ไม่ลองซ้ำ (ลองไปก็ CAPTCHA) คืนเลย
-      ให้ตัวนับ streak ข้างนอกสั่ง 'พักยาวทีเดียว' รีเซ็ต session แทน — throughput ดีกว่า
+    """เจอ Security Check -> **ค้างอยู่ที่ลิงก์นี้** รอคนมากดผ่าน ไม่เด้งไปลิงก์ใหม่
+
+    วน poll ทุก --captcha-wait วินาที (default 30) สูงสุด --captcha-rounds รอบ (default 8):
+    - poll = อ่านหน้าเดิม ไม่ reload (reload จะล้าง CAPTCHA ที่คนกำลังลาก)
+    - กดผ่านเมื่อไหร่ รอบถัดไปเจอข้อมูลเลย -> เก็บแล้วไปต่อทันที
+    - ครบทุกรอบยังไม่กด -> ข้ามลิงก์ พร้อม note "ติด CAPTCHA" ไว้เก็บซ้ำรอบหลัง
     ไม่มีการตีเป็นลิงก์ตาย: ที่ยังไม่ผ่าน = ไปกองเก็บซ้ำ"""
     alert_beep()
-    if in_streak:
-        return orig
     rec = orig
-    for k in range(1, args.captcha_retries + 1):
-        print(f"[{i}/{n}] Security Check — พัก {args.captcha_cooldown:.0f}s แล้วลองใหม่ (รอบ {k}/{args.captcha_retries}) "
-              f"[ถ้าอยู่หน้าจอ ลากจิ๊กซอว์ผ่านได้เลย]", file=sys.stderr)
-        await asyncio.sleep(args.captcha_cooldown)
-        rec = await scrape_one(page, url, js, retries=1, lazada_sold=False)
-        if not is_security_check(rec) and rec.get("product_name"):
-            print(f"[{i}/{n}] ✓ ผ่าน Security Check แล้ว", file=sys.stderr)
-            return rec
+    rounds = max(1, int(args.captcha_rounds))
+    for k in range(1, rounds + 1):
+        print(f"[{i}/{n}] 🔒 CAPTCHA — ค้างรออยู่ที่ลิงก์นี้ ({k}/{rounds}) "
+              f"รอ {args.captcha_wait:.0f}s [ลากจิ๊กซอว์ในหน้าต่าง Chrome ได้เลย]", file=sys.stderr)
+        await asyncio.sleep(args.captcha_wait)
+        probe = await read_current_page(page, url, js)      # อ่านหน้าเดิม ไม่ reload
+        if not is_security_check(probe) and probe.get("product_name"):
+            print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
+            return probe
+        rec = probe if probe.get("product_name") else rec
+        if k == rounds // 2:                                # ครึ่งทางยังไม่กด เตือนอีกที
+            alert_beep(2)
+
+    # ครบทุกรอบยังไม่มีคนกด -> ข้าม แต่ note ไว้ให้ชัดว่าติด CAPTCHA (ไว้ redo รอบหลัง)
+    total = args.captcha_wait * rounds
+    print(f"[{i}/{n}] ⏭ ไม่มีคนกด CAPTCHA ครบ {rounds}/{rounds} รอบ ({total:.0f}s) — ข้ามไว้ก่อน "
+          f"(note ไว้แล้ว เก็บซ้ำรอบหลังได้)", file=sys.stderr)
+    alert_beep(2)
+    rec = dict(rec or {})
+    rec.setdefault("url_requested", url)
+    rec.setdefault("url", url)
+    rec["source"] = "blocked"
+    rec["captcha_skipped"] = True                            # ธงให้ redo.py/กรองหาได้ง่าย
+    rec.setdefault("warnings", []).append(
+        f"ติด CAPTCHA: รอคนกดครบ {rounds} รอบ ({total:.0f}s) ไม่ผ่าน — ข้ามไว้ เก็บซ้ำรอบหลัง")
+    rec["scraped_at"] = datetime.now(TH).isoformat()
     return rec
 
 
@@ -354,7 +392,7 @@ async def scrape_loop(page, urls, js, args):
 
             rec = await scrape_one(page, url, js, retries=args.retries,
                                    lazada_sold=getattr(args, "lazada_sold", False))
-            # TikTok เจอ Security Check -> คูลดาวน์+ลองใหม่เอง (รันข้ามคืนไม่ต้องมีคน)
+            # เจอ CAPTCHA -> ค้างรอคนกดที่ลิงก์นี้ (ไม่เด้งลิงก์ใหม่) ครบรอบแล้วค่อยข้าม
             if is_security_check(rec):
                 rec = await handle_security_check(page, url, js, args, i, len(urls),
                                                   consec_captcha >= 1, rec)
@@ -375,8 +413,9 @@ async def scrape_loop(page, urls, js, args):
             else:
                 print(line)
 
-            # ยัง Security Check อยู่หลังคูลดาวน์ = อาจโดนแบน session ยาว -> พักก้อนใหญ่ให้รีเซ็ต
-            if is_security_check(rec):
+            # ยังติด CAPTCHA อยู่หลังรอคนกด = session อาจโดนแบนยาว -> พักก้อนใหญ่ให้รีเซ็ต
+            # (ตัวที่ข้ามเพราะไม่มีคนกดก็นับด้วย — ติดกันหลายตัว = ไม่มีคนเฝ้าแล้ว พักยาวคุ้มกว่าไล่ยิงต่อ)
+            if is_security_check(rec) or rec.get("captcha_skipped"):
                 consec_captcha += 1
                 if args.platform in ("tiktok", "lazada") and consec_captcha >= args.captcha_streak:
                     print(f"[captcha] โดนติดกัน {consec_captcha} ตัว (เกินกำหนด {args.captcha_streak}) "
@@ -516,9 +555,13 @@ def main():
     ap.add_argument("--retries", type=int, default=2)
     # --- กัน/กู้ CAPTCHA ของ TikTok (รันข้ามคืนไม่ต้องมีคน) ---
     ap.add_argument("--captcha-cooldown", type=float, default=60.0,
-                    help="เจอ Security Check ตัวโดดๆ: พักกี่วินาทีก่อนลองซ้ำ (default 60)")
+                    help="(ไม่ใช้แล้วในโหมดรอคน) เก็บไว้เพื่อความเข้ากันได้กับสคริปต์เดิม")
     ap.add_argument("--captcha-retries", type=int, default=1,
-                    help="ลองซ้ำ Security Check ตัวโดดๆ กี่รอบ (default 1)")
+                    help="(ไม่ใช้แล้วในโหมดรอคน) เก็บไว้เพื่อความเข้ากันได้กับสคริปต์เดิม")
+    ap.add_argument("--captcha-wait", type=float, default=30.0,
+                    help="เจอ CAPTCHA: ค้างรอคนกดรอบละกี่วินาที (default 30)")
+    ap.add_argument("--captcha-rounds", type=int, default=8,
+                    help="รอคนกด CAPTCHA กี่รอบก่อนข้ามลิงก์ (default 8 = 8x30s = 4 นาที)")
     ap.add_argument("--captcha-streak", type=int, default=3,
                     help="โดน CAPTCHA ติดกันกี่ตัว = session พัง -> พักยาว (default 3)")
     ap.add_argument("--long-cooldown", type=float, default=600.0,
