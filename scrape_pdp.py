@@ -326,15 +326,20 @@ def alert_beep(times=1):
                 pass
 
 
-async def captcha_still_on_page(page):
-    """CAPTCHA ยังค้างอยู่บนหน้าจริงไหม — อ่านข้อความบนหน้าตรง ๆ ไม่ reload
-    คืน True = ยังไม่ผ่าน / False = หายแล้ว (คนกดผ่านแล้ว หรือหน้าเปลี่ยนไปแล้ว)"""
+async def captcha_still_on_page(page, js):
+    """CAPTCHA ยังค้างอยู่ไหม — ถาม **extractor ตัวจริง** (extract_pdp.js) ไม่ reload
+
+    ห้ามเช็คเองด้วย innerText: CAPTCHA ของ TikTok เป็น canvas/element ไม่มีข้อความ
+    เช็คเองจะไม่เจอ แล้วนึกว่าคนกดผ่านแล้วทั้งที่ยังติดอยู่ (เคยพลาดมาแล้ว)
+    extract_pdp.js จับจาก document.title + #captcha-verify-image/.captcha_verify_container
+    คืน (ยังติดอยู่ไหม, record ที่อ่านได้)"""
     try:
-        txt = await page.evaluate(
-            "() => ((document.body && document.body.innerText) || '').slice(0, 4000)")
-        return bool(_CAPTCHA_RE.search(txt or ""))
+        rec = await page.evaluate(js)
+        if isinstance(rec, dict):
+            return is_security_check(rec), rec
+        return True, None
     except Exception:
-        return True          # อ่านไม่ได้ = ถือว่ายังติดไว้ก่อน ปลอดภัยกว่า
+        return True, None    # อ่านไม่ได้ = ถือว่ายังติดไว้ก่อน ปลอดภัยกว่า
 
 
 async def read_current_page(page, url, js):
@@ -367,6 +372,7 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
     ไม่มีการตีเป็นลิงก์ตาย: ที่ยังไม่ผ่าน = ไปกองเก็บซ้ำ"""
     rec = orig
     rounds = max(1, int(args.captcha_rounds))
+    limbo = 0                    # กี่รอบแล้วที่ "ไม่มี CAPTCHA แต่ก็ไม่มีข้อมูล"
     for k in range(1, rounds + 1):
         # เตือน "ทุกรอบ" ที่ยังรออยู่ — ยิ่งใกล้หมดเวลายิ่งดัง (2 ที ตั้งแต่ครึ่งทางไป)
         alert_beep(2 if k > rounds // 2 else 1)
@@ -374,28 +380,28 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
               f"รอ {args.captcha_wait:.0f}s [ลากจิ๊กซอว์ในหน้าต่าง Chrome ได้เลย]", file=sys.stderr)
         await asyncio.sleep(args.captcha_wait)
 
-        # 1) CAPTCHA ยังอยู่บนหน้าไหม (ไม่ reload — กันล้างจิ๊กซอว์ที่กำลังลาก)
-        if await captcha_still_on_page(page):
+        # 1) ถาม extractor ว่า CAPTCHA ยังอยู่ไหม (ไม่ reload — กันล้างจิ๊กซอว์ที่กำลังลาก)
+        still, probe = await captcha_still_on_page(page, js)
+        if still:
+            limbo = 0
             continue
 
-        # 2) CAPTCHA หายแล้ว = คนกดผ่านแล้ว
-        #    **ห้ามรีบ goto** — TikTok เด้ง Security Check ใหม่ทันทีถ้าสคริปต์สั่ง navigate เอง
-        #    ปกติหน้าจะเด้งกลับไปหน้าสินค้าเองหลังผ่าน ให้รอมันโหลดเองก่อน
-        print(f"[{i}/{n}] 👀 CAPTCHA หายแล้ว — รอหน้าโหลดเอง", file=sys.stderr)
-        probe = None
-        for _ in range(3):                                   # รอหน้า hydrate เอง ~9 วิ ไม่แตะอะไร
-            await asyncio.sleep(3)
-            probe = await read_current_page(page, url, js)
-            if not is_security_check(probe) and probe.get("product_name"):
-                print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
-                return probe
-            if await captcha_still_on_page(page):            # เด้ง CAPTCHA ใหม่ -> กลับไปรอคนกด
-                break
+        # 2) CAPTCHA ไม่อยู่แล้ว + มีข้อมูลสินค้า = ผ่านจริง เก็บเลย
+        if probe and probe.get("product_name"):
+            probe["url_requested"] = url
+            print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
+            return probe
 
-        # หน้าไม่ยอมโหลดเอง และ CAPTCHA ก็ไม่กลับมา -> ค่อยยอม goto (เสี่ยงโดนเด้งใหม่)
-        if not await captcha_still_on_page(page):
-            print(f"[{i}/{n}] หน้าไม่โหลดเอง — ลองเปิดใหม่อีกครั้ง", file=sys.stderr)
+        # 3) ไม่มี CAPTCHA แต่ก็ยังไม่มีข้อมูล = หน้ากำลังเปลี่ยน ให้เวลามันโหลดเอง
+        #    **ห้าม goto ทุกรอบ** — TikTok เด้ง Security Check ใหม่ทุกครั้งที่สคริปต์สั่ง navigate
+        #    (เคยพลาด: goto ทุกรอบ -> เด้ง CAPTCHA ใหม่ -> วนไม่จบทั้ง 8 รอบ)
+        limbo += 1
+        print(f"[{i}/{n}] 👀 ไม่เจอ CAPTCHA แล้ว แต่หน้ายังไม่มีข้อมูล — รอหน้าโหลดเอง ({limbo})",
+              file=sys.stderr)
+        if limbo >= 2:                       # รอ 2 รอบแล้วยังนิ่ง ค่อยยอมโหลดใหม่ ครั้งเดียว
+            print(f"[{i}/{n}] หน้าไม่โหลดเอง — เปิดหน้าใหม่อีกครั้ง", file=sys.stderr)
             probe = await scrape_one(page, url, js, retries=1, lazada_sold=False)
+            limbo = 0
             if not is_security_check(probe) and probe.get("product_name"):
                 print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
                 return probe
