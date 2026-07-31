@@ -378,16 +378,28 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
         if await captcha_still_on_page(page):
             continue
 
-        # 2) CAPTCHA หายแล้ว = คนกดผ่านแล้ว -> ตอนนี้ reload ได้ปลอดภัย
-        #    (TikTok ไม่โหลดข้อมูลสินค้าเองหลังผ่าน ต้อง goto ใหม่ถึงจะมี state)
-        print(f"[{i}/{n}] 👀 CAPTCHA หายแล้ว — โหลดหน้าสินค้าอีกครั้ง", file=sys.stderr)
-        probe = await read_current_page(page, url, js)       # ลองอ่านหน้าเดิมก่อน (เร็วกว่า)
-        if is_security_check(probe) or not probe.get("product_name"):
-            probe = await scrape_one(page, url, js, retries=1, lazada_sold=False)   # ไม่ได้ -> โหลดใหม่
-        if not is_security_check(probe) and probe.get("product_name"):
-            print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
-            return probe
-        rec = probe if probe.get("product_name") else rec
+        # 2) CAPTCHA หายแล้ว = คนกดผ่านแล้ว
+        #    **ห้ามรีบ goto** — TikTok เด้ง Security Check ใหม่ทันทีถ้าสคริปต์สั่ง navigate เอง
+        #    ปกติหน้าจะเด้งกลับไปหน้าสินค้าเองหลังผ่าน ให้รอมันโหลดเองก่อน
+        print(f"[{i}/{n}] 👀 CAPTCHA หายแล้ว — รอหน้าโหลดเอง", file=sys.stderr)
+        probe = None
+        for _ in range(3):                                   # รอหน้า hydrate เอง ~9 วิ ไม่แตะอะไร
+            await asyncio.sleep(3)
+            probe = await read_current_page(page, url, js)
+            if not is_security_check(probe) and probe.get("product_name"):
+                print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
+                return probe
+            if await captcha_still_on_page(page):            # เด้ง CAPTCHA ใหม่ -> กลับไปรอคนกด
+                break
+
+        # หน้าไม่ยอมโหลดเอง และ CAPTCHA ก็ไม่กลับมา -> ค่อยยอม goto (เสี่ยงโดนเด้งใหม่)
+        if not await captcha_still_on_page(page):
+            print(f"[{i}/{n}] หน้าไม่โหลดเอง — ลองเปิดใหม่อีกครั้ง", file=sys.stderr)
+            probe = await scrape_one(page, url, js, retries=1, lazada_sold=False)
+            if not is_security_check(probe) and probe.get("product_name"):
+                print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
+                return probe
+        rec = probe if (probe and probe.get("product_name")) else rec
 
     # ครบทุกรอบยังไม่มีคนกด -> ข้าม แต่ note ไว้ให้ชัดว่าติด CAPTCHA (ไว้ redo รอบหลัง)
     total = args.captcha_wait * rounds
