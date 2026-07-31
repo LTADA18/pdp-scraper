@@ -287,9 +287,24 @@ def is_security_check(rec):
     return bool(_CAPTCHA_RE.search(txt))
 
 
+# ตั้งเสียงเตือนเองได้ — ตั้งจาก --alert-sound/--alert-freq/... หรือ env PDP_ALERT_SOUND
+# ใส่ไฟล์ .wav ของตัวเองก็ได้ (mp3 ใช้ไม่ได้ winsound รับแต่ wav)
+ALERT = {
+    "sound": os.environ.get("PDP_ALERT_SOUND") or None,   # path ไฟล์ .wav (None = ใช้เสียงบี๊บ)
+    "freq": 880,        # ความถี่ Hz (สูง=แหลม) ใช้เมื่อไม่ได้ใส่ไฟล์เสียง
+    "dur": 300,         # ความยาวต่อครั้ง (ms)
+    "gap": 0.25,        # เว้นจังหวะระหว่างครั้ง (วินาที)
+    "off": False,       # True = ปิดเสียงทั้งหมด
+}
+
+
 def alert_beep(times=1):
     """เสียงเตือน (เผื่อมีคนอยู่หน้าจอ) — เงียบไปเองถ้าเครื่องไม่รองรับ
-    times = จำนวนครั้งที่บี๊บ (2 = เตือนหนัก ตอน CAPTCHA ค้างนานเกินกำหนด ต้องมีคนมาลาก)"""
+    times = จำนวนครั้ง (2 = เตือนหนัก ตอน CAPTCHA ค้างนานเกินกำหนด ต้องมีคนมาลาก)
+    เสียงปรับได้ที่ ALERT (ไฟล์ .wav ของตัวเอง หรือความถี่/ความยาว)"""
+    if ALERT.get("off"):
+        return
+    import time
     for j in range(max(1, times)):
         try:
             sys.stderr.write("\a"); sys.stderr.flush()
@@ -297,15 +312,29 @@ def alert_beep(times=1):
             pass
         try:
             import winsound
-            winsound.Beep(880, 300)
+            snd = ALERT.get("sound")
+            if snd and os.path.exists(snd):
+                winsound.PlaySound(snd, winsound.SND_FILENAME)      # เสียงของผู้ใช้เอง (.wav)
+            else:
+                winsound.Beep(int(ALERT["freq"]), int(ALERT["dur"]))
         except Exception:
             pass
         if j < times - 1:
             try:
-                import time
-                time.sleep(0.25)   # เว้นจังหวะให้ได้ยินเป็น 2 ที ชัด ๆ
+                time.sleep(float(ALERT["gap"]))   # เว้นจังหวะให้ได้ยินเป็นหลายที ชัด ๆ
             except Exception:
                 pass
+
+
+async def captcha_still_on_page(page):
+    """CAPTCHA ยังค้างอยู่บนหน้าจริงไหม — อ่านข้อความบนหน้าตรง ๆ ไม่ reload
+    คืน True = ยังไม่ผ่าน / False = หายแล้ว (คนกดผ่านแล้ว หรือหน้าเปลี่ยนไปแล้ว)"""
+    try:
+        txt = await page.evaluate(
+            "() => ((document.body && document.body.innerText) || '').slice(0, 4000)")
+        return bool(_CAPTCHA_RE.search(txt or ""))
+    except Exception:
+        return True          # อ่านไม่ได้ = ถือว่ายังติดไว้ก่อน ปลอดภัยกว่า
 
 
 async def read_current_page(page, url, js):
@@ -336,20 +365,29 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
     - กดผ่านเมื่อไหร่ รอบถัดไปเจอข้อมูลเลย -> เก็บแล้วไปต่อทันที
     - ครบทุกรอบยังไม่กด -> ข้ามลิงก์ พร้อม note "ติด CAPTCHA" ไว้เก็บซ้ำรอบหลัง
     ไม่มีการตีเป็นลิงก์ตาย: ที่ยังไม่ผ่าน = ไปกองเก็บซ้ำ"""
-    alert_beep()
     rec = orig
     rounds = max(1, int(args.captcha_rounds))
     for k in range(1, rounds + 1):
+        # เตือน "ทุกรอบ" ที่ยังรออยู่ — ยิ่งใกล้หมดเวลายิ่งดัง (2 ที ตั้งแต่ครึ่งทางไป)
+        alert_beep(2 if k > rounds // 2 else 1)
         print(f"[{i}/{n}] 🔒 CAPTCHA — ค้างรออยู่ที่ลิงก์นี้ ({k}/{rounds}) "
               f"รอ {args.captcha_wait:.0f}s [ลากจิ๊กซอว์ในหน้าต่าง Chrome ได้เลย]", file=sys.stderr)
         await asyncio.sleep(args.captcha_wait)
-        probe = await read_current_page(page, url, js)      # อ่านหน้าเดิม ไม่ reload
+
+        # 1) CAPTCHA ยังอยู่บนหน้าไหม (ไม่ reload — กันล้างจิ๊กซอว์ที่กำลังลาก)
+        if await captcha_still_on_page(page):
+            continue
+
+        # 2) CAPTCHA หายแล้ว = คนกดผ่านแล้ว -> ตอนนี้ reload ได้ปลอดภัย
+        #    (TikTok ไม่โหลดข้อมูลสินค้าเองหลังผ่าน ต้อง goto ใหม่ถึงจะมี state)
+        print(f"[{i}/{n}] 👀 CAPTCHA หายแล้ว — โหลดหน้าสินค้าอีกครั้ง", file=sys.stderr)
+        probe = await read_current_page(page, url, js)       # ลองอ่านหน้าเดิมก่อน (เร็วกว่า)
+        if is_security_check(probe) or not probe.get("product_name"):
+            probe = await scrape_one(page, url, js, retries=1, lazada_sold=False)   # ไม่ได้ -> โหลดใหม่
         if not is_security_check(probe) and probe.get("product_name"):
             print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
             return probe
         rec = probe if probe.get("product_name") else rec
-        if k == rounds // 2:                                # ครึ่งทางยังไม่กด เตือนอีกที
-            alert_beep(2)
 
     # ครบทุกรอบยังไม่มีคนกด -> ข้าม แต่ note ไว้ให้ชัดว่าติด CAPTCHA (ไว้ redo รอบหลัง)
     total = args.captcha_wait * rounds
@@ -562,6 +600,15 @@ def main():
                     help="เจอ CAPTCHA: ค้างรอคนกดรอบละกี่วินาที (default 30)")
     ap.add_argument("--captcha-rounds", type=int, default=8,
                     help="รอคนกด CAPTCHA กี่รอบก่อนข้ามลิงก์ (default 8 = 8x30s = 4 นาที)")
+    # --- เสียงเตือน (ตั้งเองได้) ---
+    ap.add_argument("--alert-sound", default=None,
+                    help="ไฟล์เสียงเตือนของตัวเอง (.wav เท่านั้น) — ไม่ใส่ = บี๊บธรรมดา "
+                         "ตั้งผ่าน env PDP_ALERT_SOUND ก็ได้")
+    ap.add_argument("--alert-freq", type=int, default=880,
+                    help="ความถี่เสียงบี๊บ Hz สูง=แหลม (default 880)")
+    ap.add_argument("--alert-duration", type=int, default=300,
+                    help="ความยาวเสียงบี๊บต่อครั้ง ms (default 300)")
+    ap.add_argument("--no-alert", action="store_true", help="ปิดเสียงเตือนทั้งหมด")
     ap.add_argument("--captcha-streak", type=int, default=3,
                     help="โดน CAPTCHA ติดกันกี่ตัว = session พัง -> พักยาว (default 3)")
     ap.add_argument("--long-cooldown", type=float, default=600.0,
@@ -573,6 +620,14 @@ def main():
     args = ap.parse_args()
     if not args.login and not args.urls:
         ap.error("ต้องใส่ --urls หรือ --login")
+    # ตั้งเสียงเตือนตามที่ผู้ใช้สั่ง (ไม่ใส่ = ค่า default / env PDP_ALERT_SOUND)
+    if args.alert_sound:
+        ALERT["sound"] = args.alert_sound
+        if not os.path.exists(args.alert_sound):
+            print(f"[warn] ไม่พบไฟล์เสียง {args.alert_sound} — ใช้เสียงบี๊บแทน", file=sys.stderr)
+    ALERT["freq"] = args.alert_freq
+    ALERT["dur"] = args.alert_duration
+    ALERT["off"] = args.no_alert
     asyncio.run(run(args))
 
 
