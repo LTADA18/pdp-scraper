@@ -392,6 +392,14 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
             print(f"[{i}/{n}] ✓ ผ่าน CAPTCHA แล้ว — เก็บข้อมูลต่อ", file=sys.stderr)
             return probe
 
+        # 2.5) ไม่ใช่ CAPTCHA แต่ extractor สรุปคำตอบแล้ว (สินค้าถูกลบ/ไม่พร้อมขายในภูมิภาคนี้ ฯลฯ)
+        #      = ไม่ต้องรอคนกดอะไรทั้งนั้น คืนผลเลย ไม่งั้นค้างครบ 8 รอบฟรีแล้วยังจดผิดว่า captcha_skipped
+        if probe and (probe.get("source") == "blocked" or probe.get("error")):
+            reason = (probe.get("warnings") or [probe.get("error") or "ไม่มีข้อมูล"])[0]
+            print(f"[{i}/{n}] ไม่ใช่ CAPTCHA — {str(reason)[:70]} (ไม่ต้องรอ)", file=sys.stderr)
+            probe["url_requested"] = url
+            return probe
+
         # 3) ไม่มี CAPTCHA แต่ก็ยังไม่มีข้อมูล = หน้ากำลังเปลี่ยน ให้เวลามันโหลดเอง
         #    **ห้าม goto ทุกรอบ** — TikTok เด้ง Security Check ใหม่ทุกครั้งที่สคริปต์สั่ง navigate
         #    (เคยพลาด: goto ทุกรอบ -> เด้ง CAPTCHA ใหม่ -> วนไม่จบทั้ง 8 รอบ)
