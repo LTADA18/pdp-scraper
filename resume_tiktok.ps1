@@ -4,6 +4,7 @@
 # มีคนเฝ้ากด CAPTCHA เอง อยากเร็วขึ้น:  ... -File resume_tiktok.ps1 -Delay 5
 # เปลี่ยนเสียงเตือน CAPTCHA:        ... -File resume_tiktok.ps1 -Delay 5 -AlertSound "C:\Windows\Media\Alarm03.wav"
 param(
+  [string]$Urls = "urls_tiktok_all.txt",   # ลิสต์ที่จะเก็บ (เช่น urls_tiktok_recover.txt = ตัวที่กู้จาก product_id)
   [double]$Delay = 15,          # หน่วงต่อสินค้า: 15=รันข้ามคืนไม่มีคน, 5=มีคนเฝ้ากด CAPTCHA เอง (ต่ำสุด 3)
   [double]$BatchCooldown = 90,  # เบรกทุก batch กัน CAPTCHA สะสม (0=ปิด) — แนะนำคงไว้แม้ delay ต่ำ
   [int]$BatchSize = 40,
@@ -41,5 +42,5 @@ $soundArgs += @("--alert-freq", $AlertFreq, "--alert-duration", $AlertDuration)
 if ($NoAlert) { $soundArgs += "--no-alert"; Write-Host "ปิดเสียงเตือน (-NoAlert)" }
 
 # 3) ทำต่อจากที่ค้าง (resume ข้ามตัวที่เก็บแล้ว)
-Write-Host "=== ทำต่อ TikTok scan (delay $Delay s, batch $BatchSize/$BatchCooldown s, captcha รอ $CaptchaWait s x $CaptchaRounds รอบ | Ctrl+C เพื่อหยุด, รันซ้ำได้) ==="
-& ".\.venv\Scripts\python.exe" scrape_pdp.py --urls urls_tiktok_all.txt --out "data\raw_tiktok_all.ndjson" --platform tiktok --cdp --resume --delay $Delay --batch-size $BatchSize --batch-cooldown $BatchCooldown --captcha-wait $CaptchaWait --captcha-rounds $CaptchaRounds @soundArgs
+Write-Host "=== ทำต่อ TikTok scan [$Urls] (delay $Delay s, batch $BatchSize/$BatchCooldown s, captcha รอ $CaptchaWait s x $CaptchaRounds รอบ | Ctrl+C เพื่อหยุด, รันซ้ำได้) ==="
+& ".\.venv\Scripts\python.exe" scrape_pdp.py --urls $Urls --out "data\raw_tiktok_all.ndjson" --platform tiktok --cdp --resume --delay $Delay --batch-size $BatchSize --batch-cooldown $BatchCooldown --captcha-wait $CaptchaWait --captcha-rounds $CaptchaRounds @soundArgs
