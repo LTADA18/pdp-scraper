@@ -26,11 +26,16 @@ DEAD_PATTERNS = re.compile(
 ALIVE_PATTERNS = re.compile(r"CAPTCHA|Security Check|anti-bot", re.I)
 
 # url ปลายทางเป็น "หน้าสินค้า" จริงไหม (ทุกแพลตฟอร์ม)
-PRODUCT_URL = re.compile(
-    r"-i\d{6,}"                          # lazada  ...-i1234567890
-    r"|i\.\d+\.\d+|/product/\d+/\d+"     # shopee  i.shop.item / /product/shop/item
-    r"|/pdp/|/view/product/\d+|/product/\d{6,}",   # tiktok  /pdp/.. /view/product/..
-    re.I)
+# ใช้ตัวเดียวกับ scrape_pdp.py (ที่นั่นใช้ตัดจบทันทีตอนเปิดแล้วเจอว่าปลายทางไม่ใช่หน้าสินค้า)
+# มีสำเนาสำรองเผื่อ import ไม่ได้ (เช่นเครื่องที่ไม่มี playwright แต่รัน build อย่างเดียว)
+try:
+    from scrape_pdp import PRODUCT_URL
+except Exception:
+    PRODUCT_URL = re.compile(
+        r"-i\d{6,}"                          # lazada  ...-i1234567890
+        r"|i\.\d+\.\d+|/product/\d+/\d+"     # shopee  i.shop.item / /product/shop/item
+        r"|/pdp/|/view/product/\d+|/product/\d{6,}",   # tiktok  /pdp/.. /view/product/..
+        re.I)
 
 
 def main():

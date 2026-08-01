@@ -223,12 +223,28 @@ async def wait_for_state(page, timeout_ms=8000):
         pass
 
 
+# ปลายทางเป็น "หน้าสินค้า" จริงไหม (ทุกแพลตฟอร์ม) — build_deadlist.py ใช้ตัวเดียวกัน
+PRODUCT_URL = re.compile(
+    r"-i\d{6,}"                                    # lazada  ...-i1234567890
+    r"|i\.\d+\.\d+|/product/\d+/\d+"               # shopee  i.shop.item / /product/shop/item
+    r"|/pdp/|/view/product/\d+|/product/\d{6,}",   # tiktok  /pdp/.. /view/product/..
+    re.I)
+
+
 async def scrape_one(page, url, js, retries=2, lazada_sold=False):
     last_err = None
     target = clean_url(url)
     for attempt in range(retries + 1):
         try:
             await page.goto(target, wait_until="domcontentloaded", timeout=45000)
+            # ลิงก์เด้งไปที่ที่ไม่ใช่หน้าสินค้า (หน้าแรก/ไลฟ์/แคมเปญ) = สินค้าหายแล้ว = ลิงก์ตาย
+            # ตัดจบตรงนี้เลย ไม่ต้องรอ state 8 วิ + render อีก 1.2 วิ ให้เสียเวลาฟรี
+            final = str(page.url or "")
+            if final.startswith("http") and not PRODUCT_URL.search(final):
+                return {"source": "blocked", "platform": platform_of(url),
+                        "url_requested": url, "url": final, "dead_link": True,
+                        "warnings": [f"ปลายทางไม่ใช่หน้าสินค้า ({final[:60]}) — ลิงก์ตาย"],
+                        "scraped_at": datetime.now(TH).isoformat()}
             await wait_for_state(page)
             await page.wait_for_timeout(1200)          # ให้ SPA render variation ให้เสร็จ
             rec = await page.evaluate(js)
@@ -460,6 +476,15 @@ async def scrape_loop(page, urls, js, args):
             if is_security_check(rec):
                 rec = await handle_security_check(page, url, js, args, i, len(urls),
                                                   consec_captcha >= 1, rec)
+
+            # ปลายทางไม่ใช่หน้าสินค้า = ตายถาวร -> จดลง dead_links.txt เลย รอบหน้าไม่ต้องเปิดซ้ำ
+            if rec.get("dead_link") and url not in skip_set:
+                skip_set.add(url)
+                try:
+                    with open(args.skip_dead, "a", encoding="utf-8") as dh:
+                        dh.write(url + "\n")
+                except Exception as e:
+                    print(f"[warn] จด deadlist ไม่สำเร็จ: {e}", file=sys.stderr)
 
             if rec.get("error") or not rec.get("product_name"):
                 fail += 1
