@@ -78,9 +78,19 @@ def key_of(r):
     return (r.get("platform"), str(pid)) if pid else ("url", r.get("url_requested") or r.get("url"))
 
 
-def cmd_pick(raw_path):
+def load_dead(path="data/dead_links.txt"):
+    """ลิงก์ตายที่ยืนยันแล้ว — เก็บซ้ำไปก็ได้ผลเดิม ไม่ต้องเสียเวลา"""
+    p = Path(path)
+    if not p.exists():
+        return set()
+    return {l.strip() for l in p.read_text(encoding="utf-8").splitlines()
+            if l.strip() and not l.startswith("#")}
+
+
+def cmd_pick(raw_path, deadlist="data/dead_links.txt"):
     recs = load(raw_path)
-    redo, junk, reasons = [], [], {}
+    dead = load_dead(deadlist)
+    redo, junk, reasons, skipped_dead = [], [], {}, 0
     for r in recs:
         if is_search_junk(r):
             junk.append(r.get("url_requested") or r.get("url"))
@@ -88,6 +98,9 @@ def cmd_pick(raw_path):
         reason = why_bad(r)
         if reason:
             url = r.get("url_requested") or r.get("url")
+            if url in dead:            # ตายถาวรแล้ว (สินค้าถูกลบ ฯลฯ) ข้าม
+                skipped_dead += 1
+                continue
             if url:
                 redo.append(url)
                 reasons[reason] = reasons.get(reason, 0) + 1
@@ -100,6 +113,8 @@ def cmd_pick(raw_path):
     print(f"ต้องเก็บซ้ำ: {len(set(redo))} (เขียนลง {out})")
     for reason, n in sorted(reasons.items(), key=lambda x: -x[1]):
         print(f"   - {reason}: {n}")
+    if skipped_dead:
+        print(f"ข้ามลิงก์ตายที่ยืนยันแล้ว (deadlist): {skipped_dead} — เก็บซ้ำไปก็ได้ผลเดิม")
     if junk:
         print(f"ลิงก์ใช้ไม่ได้ (ลบจาก urls.txt): {len(junk)} — เช่น /search หรืออ่าน id ไม่ได้")
     if redo:
