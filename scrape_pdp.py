@@ -314,6 +314,23 @@ ALERT = {
 }
 
 
+# อาการ "ปลายทางกันเราอยู่" ทุกแบบ ไม่ใช่แค่ CAPTCHA
+# - Shopee ไม่เด้ง CAPTCHA แต่ตอบ "API ไม่ตอบ" = โดน throttle แล้ว ต้องพักเหมือนกัน
+# - ไม่รวมสินค้าถูกลบ/ลิงก์ตาย (นั่นไม่ใช่การกัน พักไปก็ไม่ช่วย)
+_THROTTLE_RE = re.compile(
+    r"API ไม่ตอบ|anti-bot|Security Check|CAPTCHA|ยืนยันตัวตน|ลากชิ้นส่วน|"
+    r"429|too many request|rate limit",
+    re.I)
+
+
+def is_throttled(rec):
+    """โดนปลายทางกันอยู่ไหม (CAPTCHA / API ไม่ตอบ / rate limit) — ใช้ตัดสินว่าควรพัก"""
+    if is_security_check(rec):
+        return True
+    txt = " ".join([str(rec.get("error") or "")] + [str(w) for w in (rec.get("warnings") or [])])
+    return bool(_THROTTLE_RE.search(txt))
+
+
 def alert_beep(times=1):
     """เสียงเตือน (เผื่อมีคนอยู่หน้าจอ) — เงียบไปเองถ้าเครื่องไม่รองรับ
     times = จำนวนครั้ง (2 = เตือนหนัก ตอน CAPTCHA ค้างนานเกินกำหนด ต้องมีคนมาลาก)
@@ -502,13 +519,21 @@ async def scrape_loop(page, urls, js, args):
             else:
                 print(line)
 
-            # ยังติด CAPTCHA อยู่หลังรอคนกด = session อาจโดนแบนยาว -> พักก้อนใหญ่ให้รีเซ็ต
-            # (ตัวที่ข้ามเพราะไม่มีคนกดก็นับด้วย — ติดกันหลายตัว = ไม่มีคนเฝ้าแล้ว พักยาวคุ้มกว่าไล่ยิงต่อ)
-            if is_security_check(rec) or rec.get("captcha_skipped"):
+            # โดนกันอยู่ (CAPTCHA / Shopee API ไม่ตอบ / anti-bot) -> พักก้อนใหญ่ให้ session รีเซ็ต
+            # นับรวมทุกอาการที่แปลว่า "ปลายทางกันเราอยู่" ไม่ใช่แค่ CAPTCHA
+            # (Shopee ไม่มี CAPTCHA แต่ตอบ API ไม่ตอบ ถ้าไม่นับจะไล่ยิงจนโดนแบนโดยไม่พักเลย)
+            if is_throttled(rec) or rec.get("captcha_skipped"):
                 consec_captcha += 1
-                if args.platform in ("tiktok", "lazada") and consec_captcha >= args.captcha_streak:
-                    print(f"[captcha] โดนติดกัน {consec_captcha} ตัว (เกินกำหนด {args.captcha_streak}) "
-                          f"— บี๊บ 2 ที เรียกคนมาลาก แล้วพักยาว {args.long_cooldown:.0f}s ให้ session รีเซ็ต",
+                # โดนติดกันเยอะเกิน = ยิงต่อไปมีแต่เสีย (และเสี่ยงโดนแบนบัญชี) -> หยุดทั้งรอบ
+                if args.stop_streak > 0 and consec_captcha >= args.stop_streak:
+                    print(f"[หยุด] โดนกันติดกัน {consec_captcha} ตัว (เกิน --stop-streak {args.stop_streak}) "
+                          f"— หยุดรอบนี้เพื่อกันโดนแบน พักสัก 30-60 นาทีแล้วรันซ้ำ (--resume ทำต่อได้)",
+                          file=sys.stderr)
+                    alert_beep(3)
+                    break
+                if consec_captcha >= args.captcha_streak:
+                    print(f"[throttle] โดนกันติดกัน {consec_captcha} ตัว (เกินกำหนด {args.captcha_streak}) "
+                          f"— บี๊บ 2 ที แล้วพักยาว {args.long_cooldown:.0f}s ให้ session รีเซ็ต",
                           file=sys.stderr)
                     alert_beep(2)   # ค้างนานเกินกำหนด = เตือนหนัก 2 ที
                     await asyncio.sleep(args.long_cooldown)
@@ -517,10 +542,11 @@ async def scrape_loop(page, urls, js, args):
                 consec_captcha = 0
 
             if i < len(urls):
-                # พักเบรกเป็นก้อนทุก ๆ N ตัว (เฉพาะ tiktok) กัน CAPTCHA สะสม — ตัวการหลักตาม CLAUDE.md
-                if (args.platform in ("tiktok", "lazada") and args.batch_cooldown > 0
+                # พักเบรกเป็นก้อนทุก ๆ N ตัว กัน CAPTCHA/throttle สะสม — ตัวการหลักตาม CLAUDE.md
+                # ใช้ทุกแพลตฟอร์ม: Shopee ก็สะสมเหมือนกัน (เคยไม่ใส่ เลยโดนกันรัวท้ายรอบ)
+                if (args.batch_cooldown > 0
                         and args.batch_size > 0 and i % args.batch_size == 0):
-                    print(f"[batch] ครบ {args.batch_size} ตัว — พักเบรก {args.batch_cooldown:.0f}s กัน CAPTCHA สะสม",
+                    print(f"[batch] ครบ {args.batch_size} ตัว — พักเบรก {args.batch_cooldown:.0f}s กันโดนกันสะสม",
                           file=sys.stderr)
                     await asyncio.sleep(args.batch_cooldown)
                 await asyncio.sleep(random.uniform(args.delay, args.delay * 1.8))
@@ -544,6 +570,11 @@ async def run(args):
         before = len(urls)
         urls = [u for u in urls if u not in skip]
         print(f"[resume] ข้าม {before - len(urls)} URL ที่ทำไปแล้ว", file=sys.stderr)
+    if getattr(args, "limit", 0) and len(urls) > args.limit:
+        # แบ่งเก็บเป็นรอบ ๆ (โควตาต่อวัน) — ยิงรวดเดียวเยอะ ๆ คือทางลัดสู่การโดนแบน
+        print(f"[limit] รอบนี้ทำแค่ {args.limit} จาก {len(urls)} URL ที่เหลือ "
+              f"(รันซ้ำวันหลัง --resume ทำต่อเอง)", file=sys.stderr)
+        urls = urls[:args.limit]
 
     PROFILE.mkdir(exist_ok=True)
     async with async_playwright() as pw:
@@ -661,7 +692,11 @@ def main():
                     help="ความยาวเสียงบี๊บต่อครั้ง ms (default 300)")
     ap.add_argument("--no-alert", action="store_true", help="ปิดเสียงเตือนทั้งหมด")
     ap.add_argument("--captcha-streak", type=int, default=3,
-                    help="โดน CAPTCHA ติดกันกี่ตัว = session พัง -> พักยาว (default 3)")
+                    help="โดนกันติดกันกี่ตัว (CAPTCHA/API ไม่ตอบ) = session พัง -> พักยาว (default 3)")
+    ap.add_argument("--stop-streak", type=int, default=10,
+                    help="โดนกันติดกันกี่ตัว = หยุดทั้งรอบเพื่อกันโดนแบน (0=ไม่หยุด, default 10)")
+    ap.add_argument("--limit", type=int, default=0,
+                    help="ทำไม่เกินกี่ลิงก์ต่อรอบ (0=ไม่จำกัด) — แบ่งเก็บเป็นวัน ๆ ลดโอกาสโดนแบน")
     ap.add_argument("--long-cooldown", type=float, default=600.0,
                     help="พักยาวรีเซ็ต session เมื่อโดนถล่มติดกัน (วินาที, default 600=10นาที)")
     ap.add_argument("--batch-size", type=int, default=40,
