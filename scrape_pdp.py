@@ -372,6 +372,14 @@ _THROTTLE_RE = re.compile(
     re.I)
 
 
+def is_browser_dead(rec):
+    """เบราว์เซอร์/แท็บถูกปิดระหว่างรัน (ปิด Chrome, พับจอ, เครื่อง sleep)
+    ไม่ใช่ผลลัพธ์ของลิงก์ — ถ้าปล่อยให้เขียนลงไฟล์ --resume จะข้ามให้รอบหน้า เสียลิงก์ฟรี"""
+    err = str(rec.get("error") or "")
+    return ("TargetClosedError" in err or "has been closed" in err
+            or "Target crashed" in err or "browser has been closed" in err)
+
+
 def is_throttled(rec):
     """โดนปลายทางกันอยู่ไหม (CAPTCHA / API ไม่ตอบ / rate limit) — ใช้ตัดสินว่าควรพัก"""
     if is_security_check(rec):
@@ -575,6 +583,15 @@ async def scrape_loop(page, urls, js, args):
                         dh.write(url + "\n")
                 except Exception as e:
                     print(f"[warn] จด deadlist ไม่สำเร็จ: {e}", file=sys.stderr)
+
+            # เบราว์เซอร์ตาย (ปิด Chrome / พับจอ / แท็บถูกปิด) = ยิงต่อไปได้แต่ FAIL ปลอมล้วน
+            # และ --resume จะข้ามให้ในรอบหน้าด้วย -> เสียลิงก์ฟรี ต้องหยุดทันที ไม่เขียนผลลงไฟล์
+            if is_browser_dead(rec):
+                print(f"[หยุด] เบราว์เซอร์ปิดไปแล้ว ({str(rec.get('error'))[:45]}) — "
+                      f"หยุดที่ลิงก์ {i} ไม่บันทึกผลปลอม | เปิด Chrome แล้วรันซ้ำ (--resume ทำต่อได้)",
+                      file=sys.stderr)
+                alert_beep(3)
+                break
 
             if rec.get("error") or not rec.get("product_name"):
                 fail += 1
