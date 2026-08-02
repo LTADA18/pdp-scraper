@@ -386,10 +386,19 @@
       r.sold_band = item.historical_sold_display || (r.sold_count != null ? String(r.sold_count) : null);
       if (r.sold_count === null) r.warnings.push('shopee: API ไม่มี historical_sold — ตรวจ endpoint');
     } else if (lastApi.answered && lastApi.error != null) {
-      // API ตอบปกติแต่บอก error + data:null = สินค้าถูกลบ/ไม่มีแล้ว (เช่น error 266900002)
-      // เช็คจาก API ตรง ๆ แบบนี้ใช้ได้ทั้งโหมดเปิดหน้า PDP และโหมด api-only (ที่ไม่มี DOM ให้ดู)
+      // API ตอบ 200 แต่มี error code — ต้องแยกให้ออกว่า "สินค้าหาย" หรือ "โดนกัน"
+      // ผิดพลาดแล้วราคาแพง: ถ้าตีว่าหายทั้งที่โดนกัน สินค้าที่ยังขายอยู่จะถูกทิ้งถาวร
+      // จึงใช้ whitelist: เฉพาะ code ที่ยืนยันแล้วเท่านั้นที่นับว่าหาย นอกนั้นถือว่าโดนกัน (ลองใหม่ได้)
+      //   266900002 = ไม่พบสินค้า (ยืนยัน: id ปลอมได้ code นี้, หน้าเว็บไม่มีชื่อ/ราคา)
+      //   90309999  = anti-bot ปฏิเสธ (ยืนยัน: สินค้าที่เพิ่งดึงได้ 63KB พอโดนบล็อกก็ได้ code นี้)
+      var NOT_FOUND_CODES = [266900002];
+      if (NOT_FOUND_CODES.indexOf(lastApi.error) >= 0) {
+        r.source = 'blocked';
+        r.warnings.push('shopee: สินค้าถูกลบ/ไม่พบสินค้า (API error ' + lastApi.error + ')');
+        return r;
+      }
       r.source = 'blocked';
-      r.warnings.push('shopee: สินค้าถูกลบ/ไม่พบสินค้า (API error ' + lastApi.error + ')');
+      r.warnings.push('shopee: API ปฏิเสธ — โดน anti-bot (error ' + lastApi.error + ') พักแล้วลองใหม่ได้');
       return r;
     } else if (/ไม่พบสินค้า|product not found|page not found|no longer|ไม่พร้อมจำหน่าย/i
                  .test(((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 500))) {
