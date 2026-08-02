@@ -278,8 +278,17 @@
     const r = base();
     r.platform = 'shopee';
 
-    let m = location.href.match(/i\.(\d+)\.(\d+)/) || location.href.match(/\/product\/(\d+)\/(\d+)/);
-    if (m) { r.shop_id = m[1]; r.product_id = m[2]; }
+    // โหมดยิง API อย่างเดียว: สคริปต์ตั้ง window.__PDP_TARGET__ ให้ แล้วเรียกจากหน้าไหนก็ได้
+    // (ไม่ต้องเปิดหน้า PDP ทีละตัว = ตัด request ของหน้าเว็บทิ้งทั้งหมด กันโดน anti-bot)
+    const T = (typeof window !== 'undefined' && window.__PDP_TARGET__) || null;
+    let m = null;
+    if (T && T.shop_id && T.item_id) {
+      r.shop_id = String(T.shop_id); r.product_id = String(T.item_id); m = true;
+      r.url = 'https://shopee.co.th/product/' + r.shop_id + '/' + r.product_id;
+    } else {
+      m = location.href.match(/i\.(\d+)\.(\d+)/) || location.href.match(/\/product\/(\d+)\/(\d+)/);
+      if (m) { r.shop_id = m[1]; r.product_id = m[2]; }
+    }
     if (!m) { r.warnings.push('shopee: อ่าน shop_id/item_id จาก URL ไม่ได้'); return r; }
 
     const D = 100000; // Shopee เก็บราคาเป็นหน่วย 1/100000
@@ -344,7 +353,13 @@
 
       // ชื่อร้าน: get_pc มักไม่ส่ง shop_name มา — ถ้าไม่มีให้เรียก endpoint ร้านแยก
       r.shop_name = item.shop_name || (item.shop_detailed && item.shop_detailed.name) || null;
-      if (!r.shop_name && r.shop_id) {
+      // cache ต่อ shop_id: 3274 สินค้ามาจากแค่ 924 ร้าน ถ้าไม่ cache จะยิง get_shop_detail ซ้ำ 2350 ครั้งฟรี
+      // (ยิงเยอะ = โดน anti-bot เร็ว) — cache อยู่บน window อยู่ได้ตลอดอายุหน้าที่เปิดค้าง
+      if (typeof window !== 'undefined' && !window.__SHOP_CACHE__) window.__SHOP_CACHE__ = {};
+      const shopCache = (typeof window !== 'undefined' && window.__SHOP_CACHE__) || {};
+      if (!r.shop_name && r.shop_id && shopCache[r.shop_id] !== undefined) {
+        r.shop_name = shopCache[r.shop_id];          // เคยถามร้านนี้แล้ว ไม่ต้องยิงซ้ำ
+      } else if (!r.shop_name && r.shop_id) {
         for (const su of [`/api/v4/shop/get_shop_detail?shopid=${r.shop_id}`,
                           `/api/v4/product/get_shop_info?shopid=${r.shop_id}`]) {
           try {
@@ -356,6 +371,7 @@
             if (r.shop_name) break;
           } catch (e) { /* ไม่ critical ปล่อยว่าง */ }
         }
+        shopCache[r.shop_id] = r.shop_name || null;  // จำไว้ ทั้งที่เจอและไม่เจอ
       }
 
       // ยอดขาย: historical_sold = ยอดสะสมเลขเป๊ะ (ใช้ diff รายวัน), *_display เป็นช่วง "3k+" ไว้อ้างอิง

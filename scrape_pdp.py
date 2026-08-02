@@ -231,6 +231,45 @@ PRODUCT_URL = re.compile(
     re.I)
 
 
+SHOPEE_IDS = re.compile(r"-i\.(\d+)\.(\d+)|/product/(\d+)/(\d+)")
+
+
+def shopee_ids(url):
+    """ดึง (shop_id, item_id) จาก URL — ทั้ง slug -i.shop.item และ /product/shop/item"""
+    m = SHOPEE_IDS.search(url or "")
+    if not m:
+        return None
+    return (m.group(1) or m.group(3), m.group(2) or m.group(4))
+
+
+async def scrape_one_api(page, url, js):
+    """Shopee โหมดยิง API อย่างเดียว — **ไม่เปิดหน้า PDP**
+
+    ปกติ 1 สินค้า = โหลดหน้า PDP เต็ม (รูป/JS/tracking นับร้อย request) + API 2-4 ตัว
+    โหมดนี้อยู่บนหน้าเดิมที่เปิดค้างไว้ แล้วยิง fetch แบบ same-origin (cookie ไปด้วย)
+    = เหลือ ~2 request ต่อสินค้า -> โอกาสโดน anti-bot ต่ำลงมาก
+    ยึด logic แกะข้อมูลจาก extract_pdp.js ตัวเดิม (กฎเหล็กข้อ 2) แค่บอก id ผ่าน __PDP_TARGET__"""
+    ids = shopee_ids(url)
+    if not ids:
+        return {"source": "blocked", "platform": "shopee", "url_requested": url, "url": url,
+                "warnings": ["shopee: อ่าน shop_id/item_id จาก URL ไม่ได้"],
+                "scraped_at": datetime.now(TH).isoformat()}
+    shop_id, item_id = ids
+    try:
+        await page.evaluate("t => { window.__PDP_TARGET__ = t; }",
+                            {"shop_id": shop_id, "item_id": item_id})
+        rec = await page.evaluate(js)
+        if isinstance(rec, dict):
+            rec["url_requested"] = url
+            rec.setdefault("url", url)
+            return rec
+        return {"error": "extractor ไม่คืน object", "url_requested": url, "url": url,
+                "scraped_at": datetime.now(TH).isoformat()}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}", "url_requested": url, "url": url,
+                "scraped_at": datetime.now(TH).isoformat()}
+
+
 async def scrape_one(page, url, js, retries=2, lazada_sold=False):
     last_err = None
     target = clean_url(url)
@@ -466,6 +505,17 @@ async def handle_security_check(page, url, js, args, i, n, in_streak, orig):
 
 async def scrape_loop(page, urls, js, args):
     """วนเก็บทีละ URL เขียน NDJSON ต่อท้าย — ใช้ร่วมกันทั้งโหมด launch เองและโหมด --cdp"""
+    # โหมด API-only ต้องยืนอยู่บนโดเมน shopee ก่อน (fetch เป็น same-origin ถึงจะส่ง cookie)
+    # เปิดครั้งเดียวตอนเริ่ม ไม่ใช่ทุกสินค้า
+    if getattr(args, "shopee_api_only", False):
+        try:
+            if "shopee." not in str(page.url or ""):
+                await page.goto("https://shopee.co.th/", wait_until="domcontentloaded", timeout=45000)
+                await page.wait_for_timeout(2000)
+            print(f"[api-only] ยืนบนหน้า {page.url[:50]} — จากนี้ยิงแค่ API ไม่เปิดหน้า PDP",
+                  file=sys.stderr)
+        except Exception as e:
+            print(f"[api-only] เปิดหน้า shopee ตั้งต้นไม่ได้: {e}", file=sys.stderr)
     out = open(args.out, "a", encoding="utf-8") if args.out else None
     skip_set = load_skip_set(getattr(args, "skip_dead", None))
     ok = fail = skipped = 0
@@ -487,8 +537,11 @@ async def scrape_loop(page, urls, js, args):
                     print(json.dumps(rec, ensure_ascii=False))
                 continue
 
-            rec = await scrape_one(page, url, js, retries=args.retries,
-                                   lazada_sold=getattr(args, "lazada_sold", False))
+            if getattr(args, "shopee_api_only", False) and platform_of(url) == "shopee":
+                rec = await scrape_one_api(page, url, js)     # ไม่เปิดหน้า PDP ยิงแค่ API
+            else:
+                rec = await scrape_one(page, url, js, retries=args.retries,
+                                       lazada_sold=getattr(args, "lazada_sold", False))
             # เจอ CAPTCHA -> ค้างรอคนกดที่ลิงก์นี้ (ไม่เด้งลิงก์ใหม่) ครบรอบแล้วค่อยข้าม
             if is_security_check(rec):
                 rec = await handle_security_check(page, url, js, args, i, len(urls),
@@ -697,6 +750,9 @@ def main():
                     help="โดนกันติดกันกี่ตัว = หยุดทั้งรอบเพื่อกันโดนแบน (0=ไม่หยุด, default 10)")
     ap.add_argument("--limit", type=int, default=0,
                     help="ทำไม่เกินกี่ลิงก์ต่อรอบ (0=ไม่จำกัด) — แบ่งเก็บเป็นวัน ๆ ลดโอกาสโดนแบน")
+    ap.add_argument("--shopee-api-only", action="store_true",
+                    help="Shopee: ไม่เปิดหน้า PDP ทีละตัว ยิงแค่ API จากหน้าที่เปิดค้างไว้ "
+                         "(~2 request/สินค้า แทนหลักร้อย) ลดโอกาสโดน anti-bot มาก")
     ap.add_argument("--long-cooldown", type=float, default=600.0,
                     help="พักยาวรีเซ็ต session เมื่อโดนถล่มติดกัน (วินาที, default 600=10นาที)")
     ap.add_argument("--batch-size", type=int, default=40,
