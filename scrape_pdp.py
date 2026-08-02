@@ -262,6 +262,16 @@ async def scrape_one_api(page, url, js):
         if isinstance(rec, dict):
             rec["url_requested"] = url
             rec.setdefault("url", url)
+            # โหมดนี้ห้ามใช้ DOM สำรอง — DOM ของหน้าที่ยืนอยู่ไม่ใช่ของสินค้าตัวนี้
+            # (เคยพลาด: ยืนบนหน้า verify/captcha แล้วได้ชื่อสินค้าว่า "Verify to Continue")
+            # แต่ถ้า extractor สรุปมาแล้วว่าสินค้าถูกลบ ให้เก็บคำตัดสินนั้นไว้
+            # ไม่งั้นจะถูกนับเป็น "โดน anti-bot" แล้วสั่งพักยาว/หยุดรอบฟรี ๆ
+            if rec.get("source") in ("dom", "jsonld"):
+                return {"source": "blocked", "platform": "shopee",
+                        "url_requested": url, "url": url,
+                        "warnings": ["shopee: API ไม่ตอบ (api-only ไม่ใช้ DOM สำรอง "
+                                     "เพราะไม่ใช่ข้อมูลของสินค้านี้)"],
+                        "scraped_at": datetime.now(TH).isoformat()}
             return rec
         return {"error": "extractor ไม่คืน object", "url_requested": url, "url": url,
                 "scraped_at": datetime.now(TH).isoformat()}
@@ -509,13 +519,23 @@ async def scrape_loop(page, urls, js, args):
     # เปิดครั้งเดียวตอนเริ่ม ไม่ใช่ทุกสินค้า
     if getattr(args, "shopee_api_only", False):
         try:
-            if "shopee." not in str(page.url or ""):
+            cur = str(page.url or "")
+            # ต้องไม่ใช่หน้า verify/captcha — หน้านั้นก็อยู่บนโดเมน shopee เหมือนกัน
+            # ถ้าไม่เช็ค จะยืนอยู่บนหน้า CAPTCHA แล้วยิง API ไปเรื่อย ๆ โดยไม่รู้ตัว
+            if "shopee." not in cur or re.search(r"/verify/|captcha", cur, re.I):
                 await page.goto("https://shopee.co.th/", wait_until="domcontentloaded", timeout=45000)
-                await page.wait_for_timeout(2000)
-            print(f"[api-only] ยืนบนหน้า {page.url[:50]} — จากนี้ยิงแค่ API ไม่เปิดหน้า PDP",
+                await page.wait_for_timeout(2500)
+            cur = str(page.url or "")
+            if re.search(r"/verify/|captcha", cur, re.I):
+                print(f"[api-only] ❌ session ยังโดนแฟลกอยู่ (เด้งไป {cur[:60]}) "
+                      f"— ผ่าน CAPTCHA ในหน้าต่าง Chrome ก่อน แล้วค่อยรันใหม่", file=sys.stderr)
+                alert_beep(3)
+                return
+            print(f"[api-only] ยืนบนหน้า {cur[:50]} — จากนี้ยิงแค่ API ไม่เปิดหน้า PDP",
                   file=sys.stderr)
         except Exception as e:
             print(f"[api-only] เปิดหน้า shopee ตั้งต้นไม่ได้: {e}", file=sys.stderr)
+            return
     out = open(args.out, "a", encoding="utf-8") if args.out else None
     skip_set = load_skip_set(getattr(args, "skip_dead", None))
     ok = fail = skipped = 0

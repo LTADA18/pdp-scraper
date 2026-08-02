@@ -297,13 +297,19 @@
       `/api/v4/item/get?itemid=${r.product_id}&shopid=${r.shop_id}`
     ];
 
+    // จำสถานะการเรียก API ครั้งล่าสุดไว้ตัดสินว่า "สินค้าถูกลบ" หรือ "โดน anti-bot"
+    // (API ตอบ 200 + error code + data:null = สินค้าหายแล้ว ไม่ใช่โดนกัน — ต่างกันมาก
+    //  เพราะโดนกัน = พักแล้วลองใหม่ได้ ส่วนถูกลบ = ใส่ deadlist เลย)
+    const lastApi = { answered: false, error: null };
     const getItem = async (url) => {
       try {
         const res = await fetch(url, { credentials: 'include', headers: { 'x-api-source': 'pc', 'af-ac-enc-dat': '' } });
-        if (!res.ok) return null;
+        if (!res.ok) { lastApi.answered = false; return null; }
         const j = await res.json();
+        lastApi.answered = true;
+        lastApi.error = (j && j.error != null) ? j.error : null;
         return (j.data && (j.data.item || j.data)) || null;
-      } catch (e) { return null; }
+      } catch (e) { lastApi.answered = false; return null; }
     };
 
     let item = null;
@@ -379,6 +385,12 @@
       r.sold_count = num(item.historical_sold ?? item.global_sold ?? item.sold);
       r.sold_band = item.historical_sold_display || (r.sold_count != null ? String(r.sold_count) : null);
       if (r.sold_count === null) r.warnings.push('shopee: API ไม่มี historical_sold — ตรวจ endpoint');
+    } else if (lastApi.answered && lastApi.error != null) {
+      // API ตอบปกติแต่บอก error + data:null = สินค้าถูกลบ/ไม่มีแล้ว (เช่น error 266900002)
+      // เช็คจาก API ตรง ๆ แบบนี้ใช้ได้ทั้งโหมดเปิดหน้า PDP และโหมด api-only (ที่ไม่มี DOM ให้ดู)
+      r.source = 'blocked';
+      r.warnings.push('shopee: สินค้าถูกลบ/ไม่พบสินค้า (API error ' + lastApi.error + ')');
+      return r;
     } else if (/ไม่พบสินค้า|product not found|page not found|no longer|ไม่พร้อมจำหน่าย/i
                  .test(((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 500))) {
       // หน้าโหลดได้แต่ขึ้น "ไม่พบสินค้า" = สินค้าถูกลบ (Shopee ไม่ redirect url ยังเป็นหน้าสินค้า)
