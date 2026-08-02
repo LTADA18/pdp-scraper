@@ -235,7 +235,9 @@
     }
 
     // สินค้าถูกลบ/ปิดการขาย: Lazada เสิร์ฟหน้า "no longer available" ไม่มี state — บอกให้ชัด ไม่ใช่บั๊ก
-    if (!r.product_name && /no longer available|product is no longer|ไม่พร้อมจำหน่าย/i.test(document.title || '')) {
+    // ต้องรองรับ title ภาษาไทยด้วย ("ขออภัยค่ะ! ไม่พบรายการสินค้าชิ้นนี้") ไม่งั้นจะตกไปเป็น
+    // source=dom แล้วถูกส่งเข้า redo วนเก็บซ้ำฟรีทุกรอบทั้งที่สินค้าหายถาวรแล้ว
+    if (!r.product_name && /no longer available|product is no longer|ไม่พร้อมจำหน่าย|ไม่พบรายการสินค้า|ขออภัย.*ไม่พบ|page not found/i.test(document.title || '')) {
       r.source = 'blocked';
       r.warnings.push('lazada: สินค้าถูกลบ/ปิดการขายแล้ว ("' + (document.title || '').slice(0, 50) + '")');
       return r;
