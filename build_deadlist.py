@@ -73,12 +73,27 @@ def main():
                     m = DEAD_PATTERNS.search(text)
                     dead[url] = (m.group(0) if m else "ลิงก์ค้นหา")
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+    # **ต้องรวมกับของเดิม ห้ามเขียนทับ** — deadlist มีลิงก์ที่มาจากทางอื่นด้วย
+    # (check_short.py เช็คลิงก์สั้นด้วย HTTP / scrape_pdp เติมเองตอนเจอปลายทางไม่ใช่หน้าสินค้า)
+    # ลิงก์พวกนั้นไม่มีใน raw_*.ndjson ถ้าเขียนทับจะหายหมดแล้วกลับไปเปิดซ้ำใหม่ทุกรอบ
+    # (เคยพลาดมาแล้ว: 1937 -> 1126 หาย tiktok short link 1098 ตัว)
+    keep_old = 0
+    outp = Path(args.out)
+    if outp.exists():
+        for line in outp.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#") and line not in dead:
+                dead[line] = "มีอยู่เดิมใน deadlist"
+                keep_old += 1
+
+    outp.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out, "w", encoding="utf-8") as fh:
         fh.write("# ลิงก์ตายที่ยืนยันแล้ว — scrape_pdp.py ข้ามอัตโนมัติ (--skip-dead)\n")
         for url in sorted(dead):
             fh.write(url + "\n")
     print(f"ลิงก์ตายที่ยืนยัน: {len(dead)} -> {args.out}")
+    if keep_old:
+        print(f"   (รวมของเดิมที่มาจากทางอื่นไว้ด้วย {keep_old} ลิงก์)")
     from collections import Counter
     for reason, c in Counter(dead.values()).most_common():
         print(f"   - {reason}: {c}")
