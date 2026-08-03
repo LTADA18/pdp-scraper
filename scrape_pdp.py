@@ -644,7 +644,10 @@ async def scrape_loop(page, urls, js, args):
                     print(f"[batch] ครบ {args.batch_size} ตัว — พักเบรก {args.batch_cooldown:.0f}s กันโดนกันสะสม",
                           file=sys.stderr)
                     await asyncio.sleep(args.batch_cooldown)
-                await asyncio.sleep(random.uniform(args.delay, args.delay * 1.8))
+                # หน่วงแบบสุ่มทุกครั้ง ไม่ให้จังหวะคงที่ (จังหวะเป๊ะ ๆ = เครื่องหมายของบอท)
+                # --delay-max ตั้งเพดานเองได้ ไม่ใส่ = ใช้ delay*1.8 ตามเดิม
+                hi = args.delay_max if getattr(args, "delay_max", 0) > args.delay else args.delay * 1.8
+                await asyncio.sleep(random.uniform(args.delay, hi))
     finally:
         if out:
             out.close()
@@ -766,7 +769,11 @@ def main():
                     help="เติมยอดขาย Lazada จากหน้า search (PDP ไม่มี) — ช้าขึ้นเล็กน้อย, sold เกิน 1พันเป็นเลขกลม")
     ap.add_argument("--skip-dead", default="data/dead_links.txt",
                     help="ไฟล์รายชื่อลิงก์ตายที่ข้ามถาวร (สร้างด้วย build_deadlist.py)")
-    ap.add_argument("--delay", type=float, default=4.0, help="หน่วงระหว่างสินค้า (วินาที, default 4)")
+    ap.add_argument("--delay", type=float, default=4.0,
+                    help="หน่วงระหว่างสินค้า ขั้นต่ำ (วินาที, default 4) — สุ่มจริงระหว่าง delay ถึง delay-max")
+    ap.add_argument("--delay-max", type=float, default=0,
+                    help="เพดานหน่วงแบบสุ่ม (วินาที) เช่น --delay 50 --delay-max 75 = สุ่ม 50-75 วิทุกครั้ง "
+                         "ไม่ใส่ = ใช้ delay x1.8")
     ap.add_argument("--retries", type=int, default=2)
     # --- กัน/กู้ CAPTCHA ของ TikTok (รันข้ามคืนไม่ต้องมีคน) ---
     ap.add_argument("--captcha-cooldown", type=float, default=60.0,

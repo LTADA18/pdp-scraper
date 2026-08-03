@@ -8,7 +8,10 @@
 # เพิ่ม delay ไม่ช่วย เพราะตัวปัญหาคือ "จำนวน request" ไม่ใช่ความถี่ -> ใช้ -ApiOnly ดีกว่า
 param(
   [switch]$ApiOnly,             # ยิง API อย่างเดียว ไม่เปิดหน้า PDP (ลด request ~100 เท่า)
-  [double]$Delay = 18,          # โหมดปกติ 18 วิ / โหมด -ApiOnly ลดให้เอง (ดูด้านล่าง)
+  [string]$ProfileDir = ".chrome_cdp",  # โปรไฟล์ Chrome — ตั้งใหม่ (เช่น .chrome_shopee) เพื่อล้าง cookie/fingerprint เดิม
+  [int]$Port = 9222,            # debug port (ใช้ port อื่นได้ถ้าจะเปิดหลายโปรไฟล์พร้อมกัน)
+  [double]$DelayMax = 0,        # เพดานหน่วงแบบสุ่ม 0=ใช้ delay x1.8 | เช่น -Delay 50 -DelayMax 75 = สุ่ม 50-75 วิ
+  [double]$Delay = 18,          # หน่วงขั้นต่ำ / โหมด -ApiOnly ลดให้เอง (ดูด้านล่าง)
   [int]$BatchSize = 25,         # เก็บครบกี่ตัว พักเบรกทีนึง
   [double]$BatchCooldown = 180, # เบรกกี่วินาที ล้าง throttle ที่สะสม
   [int]$Limit = 400,            # โควตาต่อรอบ (0=ไม่จำกัด) — ยิงรวดเดียว 3274 ตัวเสี่ยงโดนแบน
@@ -23,11 +26,23 @@ if ($ApiOnly -and -not $PSBoundParameters.ContainsKey('BatchCooldown')) { $Batch
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-# ต้องมี Chrome เปิด debug port 9222 + login Shopee แล้ว
-$ok = try { (Invoke-WebRequest "http://localhost:9222/json/version" -TimeoutSec 3 -UseBasicParsing).StatusCode } catch { 0 }
+# เปิด Chrome ด้วยโปรไฟล์ที่เลือก ถ้ายังไม่เปิดอยู่
+# โปรไฟล์ใหม่ = cookie/localStorage/fingerprint ชุดใหม่ (แต่ IP ยังตัวเดิม ถ้าโดนที่ IP ก็ยังโดน)
+$profilePath = Join-Path $PSScriptRoot $ProfileDir
+$ok = try { (Invoke-WebRequest "http://localhost:$Port/json/version" -TimeoutSec 3 -UseBasicParsing).StatusCode } catch { 0 }
 if ($ok -ne 200) {
-  Write-Error "ไม่พบ Chrome ที่ port 9222 — เปิดก่อนด้วย:`n  & `"C:\Program Files\Google\Chrome\Application\chrome.exe`" --remote-debugging-port=9222 --user-data-dir=`"$PSScriptRoot\.chrome_cdp`"`nแล้ว login Shopee ในหน้าต่างนั้นให้เรียบร้อย"
-  exit 1
+  if (-not (Test-Path $profilePath)) {
+    New-Item -ItemType Directory -Path $profilePath | Out-Null
+    Write-Host "สร้างโปรไฟล์ใหม่: $profilePath (ยังไม่ได้ล็อกอิน — สะอาด ไม่มีประวัติเดิม)"
+  }
+  Write-Host "เปิด Chrome (port $Port, profile $ProfileDir)..."
+  Start-Process "C:\Program Files\Google\Chrome\Application\chrome.exe" `
+    -ArgumentList "--remote-debugging-port=$Port", "--user-data-dir=$profilePath", "https://shopee.co.th/"
+  Start-Sleep -Seconds 10
+  $ok = try { (Invoke-WebRequest "http://localhost:$Port/json/version" -TimeoutSec 5 -UseBasicParsing).StatusCode } catch { 0 }
+  if ($ok -ne 200) { Write-Error "เปิด Chrome ไม่สำเร็จที่ port $Port"; exit 1 }
+} else {
+  Write-Host "ใช้ Chrome ที่เปิดอยู่แล้วที่ port $Port"
 }
 
 $soundArgs = @()
@@ -35,7 +50,11 @@ if ($AlertSound -and (Test-Path $AlertSound)) { $soundArgs += @("--alert-sound",
 $modeArgs = @()
 if ($ApiOnly) { $modeArgs += "--shopee-api-only" }
 
+$delayArgs = @("--delay", $Delay)
+if ($DelayMax -gt $Delay) { $delayArgs += @("--delay-max", $DelayMax) }
+$shownDelay = if ($DelayMax -gt $Delay) { "$Delay-$DelayMax s (สุ่ม)" } else { "$Delay-$([math]::Round($Delay*1.8,1)) s (สุ่ม)" }
+
 Write-Host "=== เก็บ Shopee (Ctrl+C เพื่อหยุด, รันซ้ำ resume ต่อได้) ==="
 if ($ApiOnly) { Write-Host "โหมด API-only: ไม่เปิดหน้า PDP ยิงแค่ API (~1.3 request/สินค้า)" }
-Write-Host "delay $Delay s | เบรก $BatchCooldown s ทุก $BatchSize ตัว | โควตารอบนี้ $Limit | หยุดถ้าโดนกันติดกัน $StopStreak ตัว"
-& ".\.venv\Scripts\python.exe" scrape_pdp.py --urls urls_shopee_all.txt --out "data\raw_shopee_all.ndjson" --platform shopee --cdp --resume --delay $Delay --batch-size $BatchSize --batch-cooldown $BatchCooldown --stop-streak $StopStreak --limit $Limit @modeArgs @soundArgs
+Write-Host "delay $shownDelay | เบรก $BatchCooldown s ทุก $BatchSize ตัว | โควตารอบนี้ $Limit | หยุดถ้าโดนกันติดกัน $StopStreak ตัว"
+& ".\.venv\Scripts\python.exe" scrape_pdp.py --urls urls_shopee_all.txt --out "data\raw_shopee_all.ndjson" --platform shopee --cdp "http://localhost:$Port" --resume @delayArgs --batch-size $BatchSize --batch-cooldown $BatchCooldown --stop-streak $StopStreak --limit $Limit @modeArgs @soundArgs
