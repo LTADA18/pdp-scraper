@@ -59,7 +59,11 @@ output/            Excel ที่ส่งให้ทีม
 - `sold_today` = วันนี้ − snapshot ล่าสุดก่อนหน้า
 - `sold_mtd` = วันนี้ − ยอด ณ ต้นเดือน (ถ้าเริ่มเก็บกลางเดือน จะนับจากวันแรกที่เก็บ)
 - ยอดติดลบ (ร้านรีเซ็ต/ข้อมูลเพี้ยน) → เว้นว่าง ไม่รายงานมั่ว
-- **ห้ามลบ `data/sold_history.csv`** — เป็นฐานคำนวณ diff ทั้งหมด (อยู่ใน data/ ไม่ถูก commit)
+- **ห้ามลบ `data/sold_history.csv`** — เป็นฐานคำนวณ diff ทั้งหมด
+  **commit ไฟล์นี้ด้วย** (`git add -f data/sold_history.csv`) แม้ `data/` จะอยู่ใน .gitignore
+  เพราะเป็นไฟล์เดียวที่สร้างใหม่ไม่ได้: raw ดึงใหม่ได้เสมอ แต่ประวัติยอดสะสมของเมื่อวาน
+  ย้อนเก็บไม่ได้ ถ้าย้ายเครื่องแล้วไม่มีไฟล์นี้ `sold_today`/`sold_mtd` จะเริ่มนับใหม่จากศูนย์
+  (เคยเจอมาแล้วตอนย้ายเครื่อง)
 
 ### Lazada sold — ดึงจากหน้า search (`--lazada-sold`)
 
@@ -125,7 +129,9 @@ python normalize_pdp.py --inputs data\raw_YYYY-MM-DD.ndjson --out output\...xlsx
    (ทำบนสำเนา ไม่กระทบ `sold_history.csv` ที่ใช้คำนวณ diff)
 2. **ห้ามเขียน logic แกะข้อมูลใหม่ในไฟล์อื่น** — แก้ที่ `extract_pdp.js` ที่เดียว เพื่อให้ Claude in Chrome กับ Playwright ใช้ตัวเดียวกัน
 3. **`--delay` ห้ามต่ำกว่า 3 วินาที** ยิงรัวโดนบล็อก IP/บัญชี
-4. **ห้าม commit** `.browser_profile/` (มี cookie ล็อกอิน), `.venv/`, `data/`
+4. **ห้าม commit** `.browser_profile/` (มี cookie ล็อกอิน), `.venv/`, `output/`
+   `data/` อยู่ใน .gitignore แต่ **บังคับ commit ด้วย `-f`** เพื่อ sync ข้ามเครื่อง:
+   `raw_*.ndjson`, `dead_links.txt`, **`sold_history.csv`** (สำคัญสุด — สร้างใหม่ไม่ได้)
 5. ID สินค้าเป็น **string เสมอ** — TikTok product_id ยาว 19 หลัก ถ้าเผลอเป็น int จะเพี้ยน
 6. ตอบเป็นภาษาไทย กระชับ เน้นตัวเลขและสิ่งที่ต้อง action
 
