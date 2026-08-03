@@ -1,6 +1,7 @@
 .venv/
 .browser_profile/
 .chrome_cdp/
+.chrome_*/
 data/
 output/
 __pycache__/
