@@ -286,10 +286,15 @@ async def scrape_one(page, url, js, retries=2, lazada_sold=False):
     for attempt in range(retries + 1):
         try:
             await page.goto(target, wait_until="domcontentloaded", timeout=45000)
-            # ลิงก์เด้งไปที่ที่ไม่ใช่หน้าสินค้า (หน้าแรก/ไลฟ์/แคมเปญ) = สินค้าหายแล้ว = ลิงก์ตาย
-            # ตัดจบตรงนี้เลย ไม่ต้องรอ state 8 วิ + render อีก 1.2 วิ ให้เสียเวลาฟรี
+            # ลิงก์ "เด้งไปที่อื่น" ที่ไม่ใช่หน้าสินค้า (หน้าแรก/ไลฟ์/แคมเปญ) = สินค้าหายแล้ว
+            # ตัดจบเลย ไม่ต้องรอ state 8 วิ + render 1.2 วิ ให้เสียเวลาฟรี
+            #
+            # **ต้องเด้งจริง (url เปลี่ยน) เท่านั้น** — ลิงก์สั้น Lazada (s.lazada.co.th/s.XXXX)
+            # ไม่ redirect แต่เสิร์ฟหน้าสินค้าที่ url เดิมเลย ถ้าตัดสินจาก url อย่างเดียว
+            # จะตีสินค้าดีเป็นลิงก์ตาย (เคยพลาด: ทำสินค้าจริง 111 ตัวเข้า deadlist)
             final = str(page.url or "")
-            if final.startswith("http") and not PRODUCT_URL.search(final):
+            moved = final.rstrip("/") != clean_url(url).rstrip("/") and final.rstrip("/") != (url or "").rstrip("/")
+            if moved and final.startswith("http") and not PRODUCT_URL.search(final):
                 return {"source": "blocked", "platform": platform_of(url),
                         "url_requested": url, "url": final, "dead_link": True,
                         "warnings": [f"ปลายทางไม่ใช่หน้าสินค้า ({final[:60]}) — ลิงก์ตาย"],
