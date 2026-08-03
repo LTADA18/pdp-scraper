@@ -302,7 +302,12 @@
     // จำสถานะการเรียก API ครั้งล่าสุดไว้ตัดสินว่า "สินค้าถูกลบ" หรือ "โดน anti-bot"
     // (API ตอบ 200 + error code + data:null = สินค้าหายแล้ว ไม่ใช่โดนกัน — ต่างกันมาก
     //  เพราะโดนกัน = พักแล้วลองใหม่ได้ ส่วนถูกลบ = ใส่ deadlist เลย)
-    const lastApi = { answered: false, error: null };
+    // NOT_FOUND: code ที่ยืนยันแล้วว่าแปลว่า "ไม่มีสินค้านี้" (ไม่ใช่โดนกัน)
+    //   266900002 = get_pc ตอบว่าไม่พบ (ยืนยัน: item_id ปลอมได้ code นี้ + หน้าเว็บไม่มีชื่อ/ราคา)
+    // ต้องดู **ทุก endpoint** ไม่ใช่แค่ตัวสุดท้าย: get_pc ตอบ 266900002 แล้ว item/get ตอบ 4
+    //   ถ้าจำแค่ตัวท้าย จะเห็นเป็น error 4 -> ตีว่าโดน anti-bot -> สั่งพักยาวฟรีกับลิงก์ตาย
+    const NOT_FOUND = [266900002];
+    const lastApi = { answered: false, error: null, notFound: false };
     const getItem = async (url) => {
       try {
         const res = await fetch(url, { credentials: 'include', headers: { 'x-api-source': 'pc', 'af-ac-enc-dat': '' } });
@@ -310,6 +315,7 @@
         const j = await res.json();
         lastApi.answered = true;
         lastApi.error = (j && j.error != null) ? j.error : null;
+        if (lastApi.error != null && NOT_FOUND.indexOf(lastApi.error) >= 0) lastApi.notFound = true;
         return (j.data && (j.data.item || j.data)) || null;
       } catch (e) { lastApi.answered = false; return null; }
     };
@@ -393,8 +399,7 @@
       // จึงใช้ whitelist: เฉพาะ code ที่ยืนยันแล้วเท่านั้นที่นับว่าหาย นอกนั้นถือว่าโดนกัน (ลองใหม่ได้)
       //   266900002 = ไม่พบสินค้า (ยืนยัน: id ปลอมได้ code นี้, หน้าเว็บไม่มีชื่อ/ราคา)
       //   90309999  = anti-bot ปฏิเสธ (ยืนยัน: สินค้าที่เพิ่งดึงได้ 63KB พอโดนบล็อกก็ได้ code นี้)
-      var NOT_FOUND_CODES = [266900002];
-      if (NOT_FOUND_CODES.indexOf(lastApi.error) >= 0) {
+      if (lastApi.notFound) {
         r.source = 'blocked';
         r.warnings.push('shopee: สินค้าถูกลบ/ไม่พบสินค้า (API error ' + lastApi.error + ')');
         return r;
