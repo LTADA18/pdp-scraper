@@ -580,6 +580,36 @@ async def scrape_loop(page, urls, js, args):
                 rec = await handle_security_check(page, url, js, args, i, len(urls),
                                                   consec_captcha >= 1, rec)
 
+            # โดน anti-bot (Shopee ตอบ error ไม่ใช่หน้า CAPTCHA) -> พักให้คนไปกดในหน้าต่าง Chrome
+            # แล้ว **ลองลิงก์เดิมซ้ำ** ไม่ข้าม ไม่หยุดรัน (flow ที่ทีมใช้ได้ผลจริง)
+            if is_throttled(rec) and not is_security_check(rec) and args.captcha_rounds > 0:
+                rounds = int(args.captcha_rounds)
+                for k in range(1, rounds + 1):
+                    alert_beep(2)
+                    # โหมด api-only ยืนอยู่หน้าแรก ไม่มี CAPTCHA ให้คนกด -> พาไปหน้าสินค้าจริงก่อน
+                    # Shopee จะเด้ง CAPTCHA ที่หน้านั้น คนถึงจะกดผ่านได้ (flow เดียวกับที่ทีมใช้)
+                    try:
+                        await page.goto(clean_url(url), wait_until="domcontentloaded", timeout=45000)
+                    except Exception:
+                        pass
+                    print(f"[{i}/{len(urls)}] 🔒 โดน anti-bot — เปิดหน้าสินค้าให้แล้ว "
+                          f"**ไปกด CAPTCHA ในหน้าต่าง Chrome** แล้วรอ {args.captcha_wait:.0f}s "
+                          f"(ครั้งที่ {k}/{rounds}) — จะลองลิงก์เดิมซ้ำ ไม่หยุดรัน", file=sys.stderr)
+                    await asyncio.sleep(args.captcha_wait)
+                    if getattr(args, "shopee_api_only", False) and platform_of(url) == "shopee":
+                        retry = await scrape_one_api(page, url, js)
+                    else:
+                        retry = await scrape_one(page, url, js, retries=1,
+                                                 lazada_sold=getattr(args, "lazada_sold", False))
+                    if is_browser_dead(retry):
+                        rec = retry
+                        break
+                    if not is_throttled(retry):
+                        print(f"[{i}/{len(urls)}] ✓ ผ่านแล้ว — เก็บลิงก์เดิมต่อ", file=sys.stderr)
+                        rec = retry
+                        break
+                    rec = retry
+
             # ปลายทางไม่ใช่หน้าสินค้า = ตายถาวร -> จดลง dead_links.txt เลย รอบหน้าไม่ต้องเปิดซ้ำ
             if rec.get("dead_link") and url not in skip_set:
                 skip_set.add(url)
