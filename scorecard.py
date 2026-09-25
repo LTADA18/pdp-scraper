@@ -92,6 +92,20 @@ async def ajax(page, path):
     return res["j"]
 
 
+def abs_url(u):
+    """itemUrl ของ Lazada มีทั้ง /products/... และ //www.lazada.co.th/products/... (เจอจริงร้าน captain-akesteel)"""
+    u = str(u or "")
+    return "https:" + u if u.startswith("//") else BASE + u if u.startswith("/") else u
+
+
+NET_ERR = ("ERR_NAME_NOT_RESOLVED", "ERR_INTERNET_DISCONNECTED", "ERR_CONNECTION_TIMED_OUT",
+           "ERR_NETWORK_CHANGED", "ERR_CONNECTION_RESET", "Failed to fetch")
+
+
+class NetworkDown(Exception):
+    """เน็ตหลุดติดกันหลายหน้า — หยุดทั้งรอบ ไม่นับเป็นหน้าที่ล้ม (2026-09-25 เน็ตหลุด ~13:00 ทำให้ 302 หน้าล้มหมด)"""
+
+
 def items_of(j):
     return ((j or {}).get("mods") or {}).get("listItems") or []
 
@@ -141,7 +155,7 @@ async def resolve_shop(page, text, delay):
             await page.wait_for_timeout(int(delay * 1000))
             hit = next((x for x in items if norm(x.get("sellerName")) == norm(text)), None)
             if hit:
-                url = BASE + hit["itemUrl"] if str(hit.get("itemUrl", "")).startswith("/") else hit.get("itemUrl")
+                url = abs_url(hit.get("itemUrl"))
                 await page.goto(url, wait_until="domcontentloaded", timeout=60000)
                 for _ in range(20):
                     su = await page.evaluate("() => { try { const s = window.__moduleData__.data.root.fields.seller; return s && s.url; } catch (e) { return null; } }")
@@ -305,7 +319,7 @@ async def run(a):
                                      "orig": R.num(it.get("originalPrice")), "image": it.get("image"),
                                      "rating": R.num(it.get("ratingScore")), "review": R.num(it.get("review")),
                                      "sold": it.get("itemSoldCntShow"), "sold_n": R.sold_n(it.get("itemSoldCntShow")) or 0,
-                                     "url": BASE + it["itemUrl"] if str(it.get("itemUrl", "")).startswith("/") else it.get("itemUrl"),
+                                     "url": abs_url(it.get("itemUrl")),
                                      **{k: q[k] for k in ("brand", "type", "model", "unknown", "known", "below", "pmin")}})
                     await page.wait_for_timeout(int(a.delay * 1000))
                     if len(its) < 40 or len(rows) >= (total_n or 0):
@@ -314,6 +328,7 @@ async def run(a):
                 sid = f"lzd-{slug}-{stamp}"
                 # ตรวจละเอียดทุกหน้า (ได้คะแนนเต็มครบ) · เก็บรูปเฉพาะ --max หน้าที่ขายดีสุด
                 deep = sorted(rows, key=lambda r: -r["sold_n"])[:a.max_deep]
+                net_fail = 0
                 for n_done, r in enumerate(deep):
                     try:
                         rid, doc, files = await deep_one(page, r["url"], ref, req_id, a.delay, out, stamp, sid,
@@ -327,6 +342,11 @@ async def run(a):
                     except Exception as e:  # noqa: BLE001
                         r["error"] = str(e)[:200]
                         results.append({"url": r["url"], "error": str(e)[:300]})
+                        net_fail = net_fail + 1 if any(k in str(e) for k in NET_ERR) else 0
+                        if net_fail >= 5:
+                            raise NetworkDown(f"เน็ตหลุด — เปิดหน้าไม่ได้ติดกัน {net_fail} หน้า ({str(e).splitlines()[0][:80]}) ตรวจใหม่เมื่อเน็ตกลับมา")
+                    else:
+                        net_fail = 0
                 # รูปการ์ดของทุกหน้าในร้าน (ย่อ 160px) รวมเป็นก้อนละ ≤ 180 KB — db จำกัด 256 KiB/เอกสาร
                 chunk, size, k = {}, 0, 0
                 for r in rows:
@@ -356,7 +376,7 @@ async def run(a):
             summary.update(status="done" if ok or summary.get("kind") == "shop" else "error",
                            result_ids=[r["id"] for r in ok],
                            note="" if ok else "; ".join(r.get("error", "") for r in results)[:300])
-        except Blocked as e:
+        except (Blocked, NetworkDown) as e:
             summary.update(status="error", note=str(e))
         finally:
             await page.close()             # ปิดเฉพาะแท็บของเรา
