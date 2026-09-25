@@ -30,7 +30,8 @@ def main():
             continue
         seen.add(k)
         w = {"op": "set", "collection": e["collection"], "doc_id": e["doc_id"], "file_path": Path(e["file"]).as_posix()}
-        (imgs if "/imgs" in e["collection"] else shops if e["collection"] == "shops" else results).append(w)
+        # รูป (results/*/imgs, shops/*/thumbs) -> ผล/การ์ด -> ร้าน -> คำขอ : หน้าเว็บเห็นเฉพาะของที่ครบแล้ว
+        (imgs if ("/imgs" in e["collection"] or "/thumbs" in e["collection"]) else shops if e["collection"] == "shops" else results).append(w)
 
     totals = [r.get("total") for r in s.get("results") or [] if r.get("id")]
     req = {"status": s.get("status", "error"), "started_at": s.get("started_at"), "finished_at": s.get("finished_at"),

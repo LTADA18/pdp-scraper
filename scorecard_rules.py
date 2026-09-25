@@ -14,9 +14,14 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import statistics as st
+from datetime import datetime
+from pathlib import Path
+
+CACHE = Path(__file__).resolve().parent / "output" / "scorecard" / "_refcache.json"
 
 # ---------------------------------------------------------------- ข้อมูลอ้างอิง
 
@@ -28,7 +33,10 @@ def load_ref() -> dict:
     os.environ.setdefault("PGCLIENTENCODING", "UTF8")
     try:
         import psycopg
-        with psycopg.connect("service=osuka", connect_timeout=15) as conn, conn.cursor() as cur:
+        # ⚠️ งาน sync price list (db_builder) ล็อกตารางค้างได้เป็นสิบนาที — เคยทำให้การตรวจค้างเงียบ (2026-09-25)
+        #    รอสูงสุด 15 วิ แล้วถอยไปใช้ข้อมูลชุดล่าสุดที่บันทึกไว้
+        with psycopg.connect("service=osuka", connect_timeout=15,
+                             options="-c lock_timeout=15000 -c statement_timeout=30000") as conn, conn.cursor() as cur:
             cur.execute("select model_number, coalesce(status,''), sku, coalesce(product_name,'') "
                         "from intel.osuka_master_data_product where model_number is not null")
             for m, stt, sku, name in cur.fetchall():
@@ -43,8 +51,18 @@ def load_ref() -> dict:
             for m, name, lo, hi, act in cur.fetchall():
                 ref["portal"][m.strip().upper()] = {"name": name, "min": float(lo) if lo is not None else None,
                                                     "max": float(hi) if hi is not None else None, "active": bool(act)}
-    except Exception as e:  # noqa: BLE001 — ไม่มีฐาน = ข้ามข้อที่ต้องใช้ ไม่ล้มทั้งงาน
-        ref["error"] = f"{type(e).__name__}: {e}"[:200]
+        CACHE.parent.mkdir(parents=True, exist_ok=True)
+        CACHE.write_text(json.dumps({"saved_at": datetime.now().isoformat(timespec="seconds"),
+                                     "master": ref["master"], "portal": ref["portal"]}, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — ไม่มีฐาน = ใช้ชุดที่บันทึกไว้ ถ้าไม่มีเลยค่อยข้ามข้อที่ต้องใช้
+        ref["master"], ref["portal"] = {}, {}
+        err = f"{type(e).__name__}: {e}"[:160]
+        if CACHE.exists():
+            c = json.loads(CACHE.read_text(encoding="utf-8"))
+            ref["master"], ref["portal"] = c["master"], c["portal"]
+            ref["error"] = f"อ่าน Postgres ไม่ได้ ({err}) — ใช้ทะเบียน/price list ชุดที่บันทึกเมื่อ {c['saved_at']}"
+        else:
+            ref["error"] = err
     # เทียบรหัสแบบไม่สนขีด: ทะเบียนมีทั้ง OCHD802-D2 และ OSID-520 / OSID-LT520 / OCDS-001
     ref["mnorm"] = {mnorm(k): k for k in ref["master"]}
     ref["pnorm"] = {mnorm(k): k for k in ref["portal"]}

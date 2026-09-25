@@ -176,7 +176,7 @@ def result_doc(rec, card, pos, med, query, cover_white, sc, req_id):
     }
 
 
-async def deep_one(page, url, ref, req_id, delay, out, stamp):
+async def deep_one(page, url, ref, req_id, delay, out, stamp, shop_id=None, with_images=True):
     rec = await open_pdp(page, url, delay)
     if not rec.get("product_name"):
         raise RuntimeError("เปิดหน้าสินค้าแล้วอ่านข้อมูลไม่ได้: " + "; ".join(rec.get("warnings") or [])[:200])
@@ -198,23 +198,45 @@ async def deep_one(page, url, ref, req_id, delay, out, stamp):
     doc = result_doc(rec, card, pos, med, query, white, sc, req_id)
     rid = f"lzd-{pid}-{stamp}"        # 1 รอบตรวจ = 1 เอกสาร (ตรวจซ้ำไม่ทับของเดิม เก็บเป็นประวัติ)
     files = [write(out, "results", rid, doc)]
-    imgs = []
-    if cover:
-        imgs.append(("cover", cover))
-    for k, u in enumerate(list(dict.fromkeys(rec.get("images") or []))[:12]):
-        d, _ = img_uri(u, 480)
-        if d:
-            imgs.append((f"g{k:02d}", d))
-    for k, u in enumerate((rec.get("description_images") or [])[:10]):
-        d, _ = img_uri(u, 720)
-        if d:
-            imgs.append((f"d{k:02d}", d))
-    for name, d in imgs:
-        files.append(write(out, f"results/{rid}/imgs", name, {"src": d}))
-    doc["n_gallery"] = sum(1 for n, _ in imgs if n.startswith("g"))
-    doc["n_desc_imgs"] = sum(1 for n, _ in imgs if n.startswith("d"))
+    # รูปรวมเป็นก้อน (≤ 220 KB/เอกสาร) แทน 1 รูป = 1 เอกสาร — db ทั้งหน้าจุ 5,000 เอกสาร
+    # ตรวจทั้งร้าน 100+ หน้า ถ้าแยกรูปละเอกสารจะใช้ ~20 เอกสาร/หน้า เต็มในไม่กี่ร้าน (รูปปกอยู่ในการ์ดแล้ว)
+    # ตรวจทั้งร้าน: คะแนนนับจากหน้าจริงครบทุกหน้า แต่เก็บรูปแกลเลอรี/คำอธิบายเฉพาะหน้าที่ขายดี (with_images)
+    gal = [d for d, _ in (img_uri(u, 480) for u in list(dict.fromkeys(rec.get("images") or []))[:12]) if d] if with_images else []
+    dsc = [d for d, _ in (img_uri(u, 640) for u in (rec.get("description_images") or [])[:10]) if d] if with_images else []
+    gal = [d for d in gal if len(d) < 240_000]
+    dsc = [d for d in dsc if len(d) < 240_000]
+
+    def packs(prefix, items):
+        docs, cur, size = [], [], 0
+        for d in items:
+            if cur and size + len(d) > 220_000:
+                docs.append((f"{prefix}{len(docs)}", cur))
+                cur, size = [], 0
+            cur.append(d)
+            size += len(d)
+        if cur:
+            docs.append((f"{prefix}{len(docs)}", cur))
+        return docs
+
+    for name, items in packs("g", gal) + packs("d", dsc):
+        files.append(write(out, f"results/{rid}/imgs", name, {"items": items}))
+    doc["n_gallery"] = len(gal)
+    doc["n_desc_imgs"] = len(dsc)
+    doc["images_stored"] = with_images
+    doc["gallery_count"] = len(dict.fromkeys(rec.get("images") or []))   # จำนวนรูปจริงบนหน้า (ใช้แสดงแม้ไม่ได้เก็บรูป)
     doc["has_cover"] = bool(cover)
     write(out, "results", rid, doc)            # เขียนทับพร้อมจำนวนรูป
+    # การ์ดย่อสำหรับหน้า Marketplace ของเว็บ (เล็ก โหลดทีละหลายใบได้ — ผลเต็มอยู่ใน results/<rid>)
+    fails = [c for L in ("L1", "L2", "L3", "L4") if doc.get(L) for c in doc[L]["checks"]
+             if c.get("ok") is False or (c.get("ok") and c.get("ratio") is not None and c["ratio"] < 1)]
+    files.append(write(out, "cards", rid, {
+        "rid": rid, "pid": pid, "url": doc["url"], "title": doc["title"], "seller": doc["seller"],
+        "price": doc["price"], "orig": doc["orig"], "rating": doc["rating"], "review_count": doc["review_count"],
+        "sold": doc["sold"], "total": doc["total"], "below": doc["below"],
+        "layers": {L: (doc[L] or {}).get("score") for L in ("L1", "L2", "L3", "L4")},
+        "fix_main": sum(1 for c in fails if c.get("main")), "fix_all": len(fails),
+        "search_pos": pos, "search_query": query, "cover": cover,
+        "shop_id": shop_id, "request_id": req_id, "scraped_at": doc["scraped_at"]}))
     return rid, doc, files
 
 
@@ -280,6 +302,7 @@ async def run(a):
                         price = R.num(it.get("price"))
                         q = R.quick_title_check(it.get("name"), price, ref)
                         rows.append({"id": str(it.get("nid") or it.get("itemId")), "name": it.get("name"), "price": price,
+                                     "orig": R.num(it.get("originalPrice")), "image": it.get("image"),
                                      "rating": R.num(it.get("ratingScore")), "review": R.num(it.get("review")),
                                      "sold": it.get("itemSoldCntShow"), "sold_n": R.sold_n(it.get("itemSoldCntShow")) or 0,
                                      "url": BASE + it["itemUrl"] if str(it.get("itemUrl", "")).startswith("/") else it.get("itemUrl"),
@@ -288,10 +311,14 @@ async def run(a):
                     if len(its) < 40 or len(rows) >= (total_n or 0):
                         break
                     pg += 1
-                deep = sorted(rows, key=lambda r: -r["sold_n"])[:a.max]
-                for r in deep:
+                sid = f"lzd-{slug}-{stamp}"
+                # ตรวจละเอียดทุกหน้า (ได้คะแนนเต็มครบ) · เก็บรูปเฉพาะ --max หน้าที่ขายดีสุด
+                deep = sorted(rows, key=lambda r: -r["sold_n"])[:a.max_deep]
+                for n_done, r in enumerate(deep):
                     try:
-                        rid, doc, files = await deep_one(page, r["url"], ref, req_id, a.delay, out, stamp)
+                        rid, doc, files = await deep_one(page, r["url"], ref, req_id, a.delay, out, stamp, sid,
+                                                         with_images=n_done < a.max)
+                        print(f"  [{n_done + 1}/{len(deep)}] {doc['total']} {doc['title'][:40]}", flush=True)
                         manifest += files
                         r["result_id"], r["total"] = rid, doc["total"]
                         results.append({"id": rid, "total": doc["total"], "title": doc["title"]})
@@ -300,6 +327,22 @@ async def run(a):
                     except Exception as e:  # noqa: BLE001
                         r["error"] = str(e)[:200]
                         results.append({"url": r["url"], "error": str(e)[:300]})
+                # รูปการ์ดของทุกหน้าในร้าน (ย่อ 160px) รวมเป็นก้อนละ ≤ 180 KB — db จำกัด 256 KiB/เอกสาร
+                chunk, size, k = {}, 0, 0
+                for r in rows:
+                    d, _ = img_uri(r.pop("image", None) or "", 160) if r.get("image") else (None, None)
+                    if not d:
+                        continue
+                    if chunk and size + len(d) > 180_000:
+                        manifest.append(write(out, f"shops/{sid}/thumbs", f"t{k:02d}", {"items": chunk}))
+                        chunk, size, k = {}, 0, k + 1
+                    chunk[r["id"]] = d
+                    size += len(d)
+                    r["thumb"] = f"t{k:02d}"
+                if chunk:
+                    manifest.append(write(out, f"shops/{sid}/thumbs", f"t{k:02d}", {"items": chunk}))
+                for r in rows:
+                    r.pop("image", None)
                 tots = [r["total"] for r in rows if r.get("total") is not None]
                 shop = {"platform": "lazada", "slug": slug, "name": sname, "url": f"{BASE}/shop/{slug}/",
                         "request_id": req_id, "osuka_listings": len(rows), "store_total_hits": total_n,
@@ -307,8 +350,8 @@ async def run(a):
                         "title_complete": sum(1 for r in rows if r["brand"] and r["type"] and r["model"]),
                         "unknown_model": sum(1 for r in rows if r["unknown"]), "below_price": sum(1 for r in rows if r["below"]),
                         "rows": rows[:400], "scraped_at": now()}
-                manifest.append(write(out, "shops", f"lzd-{slug}-{stamp}", shop))
-                summary.update(kind="shop", shop_id=f"lzd-{slug}-{stamp}", shop_name=sname, results=results)
+                manifest.append(write(out, "shops", sid, shop))
+                summary.update(kind="shop", shop_id=sid, shop_name=sname, results=results)
             ok = [r for r in results if r.get("id")]
             summary.update(status="done" if ok or summary.get("kind") == "shop" else "error",
                            result_ids=[r["id"] for r in ok],
@@ -336,7 +379,8 @@ def main():
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--url", nargs="+", help="ลิงก์หน้าสินค้า Lazada (หลายลิงก์ได้)")
     g.add_argument("--shop", help="ชื่อร้าน หรือ ลิงก์หน้าร้าน Lazada")
-    ap.add_argument("--max", type=int, default=10, help="จำนวนหน้าสินค้าที่ตรวจลึกในร้าน (เลือกจากยอดขาย)")
+    ap.add_argument("--max", type=int, default=10, help="จำนวนหน้าที่เก็บรูปครบ (ขายดีสุดก่อน)")
+    ap.add_argument("--max-deep", type=int, default=400, help="จำนวนหน้าที่ตรวจละเอียด/ให้คะแนนเต็มในร้าน (ค่าเริ่มต้น = ทุกหน้า)")
     ap.add_argument("--max-pages", type=int, default=8, help="หน้ารายการในร้านสูงสุด (40 ชิ้น/หน้า)")
     ap.add_argument("--cdp", default="http://localhost:9222")
     ap.add_argument("--delay", type=float, default=4.0)
