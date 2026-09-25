@@ -3,6 +3,7 @@
    รันผ่าน Claude in Chrome -> javascript_tool บนหน้า product detail page
    คืนค่า JSON เดียวกันทุกแพลตฟอร์ม:
      product_name, price, original_price, spec, variation, platform
+     + images / image_count / video_count / rating / review_count / rating_breakdown (เพิ่ม 2026-09-25)
 
    วิธีใช้:
      1) navigate ไปหน้าสินค้า
@@ -62,6 +63,30 @@
     return null;
   };
 
+  // รูปของ Lazada/TikTok บางตัวมาเป็น //host/path ไม่มี scheme
+  const absUrl = (u) => (typeof u === 'string' && u) ? (u.startsWith('//') ? 'https:' + u : u) : null;
+
+  const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+  // จำนวนรีวิวแยกดาว 5 ช่อง — แต่ละเว็บเรียงไม่เหมือนกัน (1→5 หรือ 5→1)
+  // ไม่เดาลำดับ: ลองทั้งสองแบบ แล้วเลือกแบบที่คิดค่าเฉลี่ยออกมาใกล้คะแนนที่เว็บแสดง
+  // ถ้าเว็บไม่ให้คะแนนเฉลี่ยมาเทียบ หรือทั้งสองแบบห่างเกิน 0.3 ดาว -> คืน null ไม่ใส่มั่ว
+  const starBreakdown = (counts, avg) => {
+    if (!Array.isArray(counts) || counts.length !== 5) return null;
+    const c = counts.map(num);
+    if (c.some(x => x === null)) return null;
+    const total = c.reduce((a, b) => a + b, 0);
+    if (!total) return { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+    if (avg === null || avg === undefined) return null;
+    const asc = c.reduce((a, n, i) => a + n * (i + 1), 0) / total;    // [1★..5★]
+    const desc = c.reduce((a, n, i) => a + n * (5 - i), 0) / total;   // [5★..1★]
+    const da = Math.abs(asc - avg), dd = Math.abs(desc - avg);
+    if (Math.min(da, dd) > 0.3) return null;
+    return dd <= da
+      ? { 5: c[0], 4: c[1], 3: c[2], 2: c[3], 1: c[4] }
+      : { 5: c[4], 4: c[3], 3: c[2], 2: c[1], 1: c[0] };
+  };
+
   const jsonLd = () => {
     const out = [];
     document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
@@ -105,6 +130,14 @@
     skus: [],               // [{sku_id, option_path, price, original_price, stock}]
     sold_count: null,       // ยอดขายสะสม (เลขเป๊ะ) — ใช้ diff รายวัน; Lazada PDP ไม่มี
     sold_band: null,        // ข้อความยอดขายแบบช่วง เช่น "3k+" (ไว้อ้างอิง)
+    // ---- ใช้กับ Listing Scorecard ----
+    // null = หา field ไม่เจอ/ยังไม่โหลด (ไม่รู้)  ≠  0 = รู้แน่ว่าไม่มี — ห้ามเอา null ไปนับเป็น 0
+    images: [],             // URL รูปหลักของสินค้า เรียงตามหน้าเว็บ ตัวแรก = รูปปก (ไม่รวมรูปแยกตามตัวเลือก)
+    image_count: null,
+    video_count: null,      // วิดีโอในแกลเลอรีสินค้า (ไม่นับคลิปครีเอเตอร์/ไลฟ์)
+    rating: null,           // คะแนนเฉลี่ย 0–5 — ยังไม่มีรีวิวเลย = null ไม่ใช่ 0
+    review_count: null,     // จำนวนเรตติ้งทั้งหมด
+    rating_breakdown: null, // {5: n, 4: n, 3: n, 2: n, 1: n}
     source: null,           // state | api | jsonld | dom
     scraped_at: new Date().toISOString(),
     warnings: []
@@ -128,7 +161,7 @@
   // ============================================================
   // LAZADA  — window.__moduleData__ .data.root.fields
   // ============================================================
-  const lazada = () => {
+  const lazada = async () => {
     const r = base();
     r.platform = 'lazada';
     const mid = location.href.match(/-i(\d+)(?:-s(\d+))?\.html/);
@@ -145,7 +178,15 @@
     }
 
     const md = window.__moduleData__ || window.__INITIAL_STATE__ || null;
-    const f = md && deepFind(md, o => o.product && (o.skuBase || o.skuInfos));
+    const findFields = () => md && deepFind(md, o => o.product && (o.skuBase || o.skuInfos));
+    let f = findFields();
+
+    // review / seller / specifications มาทีหลังด้วย CSR (ยืนยัน 2026-09-25: ตอนหน้าเพิ่งโหลด
+    // root.fields มีแค่ product/skuGalleries/skuInfos) — รอสูงสุด 8 วิ ไม่งั้น rating เป็น null ทั้งแผง
+    if (f && !f.review) {
+      try { window.scrollTo(0, (document.body.scrollHeight || 2000) / 2); } catch (e) { /* ignore */ }
+      for (let i = 0; i < 16 && !(f && f.review); i++) { await sleep(500); f = findFields() || f; }
+    }
 
     if (f) {
       r.source = 'state';
@@ -232,6 +273,29 @@
           });
         });
       }
+
+      // ---- รูป / วิดีโอ: skuGalleries["0"] = แกลเลอรีระดับสินค้า ----
+      // คีย์อื่นเป็นแกลเลอรีต่อ sku (ซ้ำกับตัวหลัก) ไม่นับ
+      // ยืนยันกับหน้าจริง 2026-09-25: รูป = {type:"img", src}, วิดีโอ = {type:"video", src:YouTube} หรือ {type:"video", videoID}
+      const gal = f.skuGalleries || null;
+      const itemGal = gal && (Array.isArray(gal['0']) ? gal['0'] : Object.values(gal).find(Array.isArray));
+      if (itemGal) {
+        r.images = [...new Set(itemGal.filter(x => x && x.type === 'img' && x.src).map(x => absUrl(x.src)))];
+        r.image_count = r.images.length;
+        r.video_count = itemGal.filter(x => x && /video/i.test(x.type || '')).length;
+      } else {
+        r.warnings.push('lazada: ไม่พบ skuGalleries — images/video_count เป็น null');
+      }
+
+      // ---- รีวิว: {averageRating, reviews, scores:[5★..1★]} (ยืนยัน 2026-09-25: [72,2,0,1,1] เฉลี่ย 4.9) ----
+      const rv = f.review || null;
+      if (rv && (rv.averageRating !== undefined || rv.reviews !== undefined)) {
+        r.review_count = num(rv.reviews ?? rv.ratings ?? rv.contentedNum);
+        r.rating = r.review_count ? num(rv.averageRating) : null;
+        r.rating_breakdown = starBreakdown(rv.scores, r.rating);
+      } else {
+        r.warnings.push('lazada: รีวิวยังไม่โหลด (มาทีหลังด้วย CSR) — rating/review_count เป็น null');
+      }
     }
 
     // สินค้าถูกลบ/ปิดการขาย: Lazada เสิร์ฟหน้า "no longer available" ไม่มี state — บอกให้ชัด ไม่ใช่บั๊ก
@@ -308,11 +372,14 @@
     //   ถ้าจำแค่ตัวท้าย จะเห็นเป็น error 4 -> ตีว่าโดน anti-bot -> สั่งพักยาวฟรีกับลิงก์ตาย
     const NOT_FOUND = [266900002];
     const lastApi = { answered: false, error: null, notFound: false };
+    // เก็บ data ทั้งก้อนของทุก endpoint ไว้ด้วย — get_pc วางรูป/รีวิวไว้ข้าง ๆ data.item ไม่ใช่ข้างใน
+    const apiData = [];
     const getItem = async (url) => {
       try {
         const res = await fetch(url, { credentials: 'include', headers: { 'x-api-source': 'pc', 'af-ac-enc-dat': '' } });
         if (!res.ok) { lastApi.answered = false; return null; }
         const j = await res.json();
+        if (j && j.data) apiData.push(j.data);
         lastApi.answered = true;
         lastApi.error = (j && j.error != null) ? j.error : null;
         if (lastApi.error != null && NOT_FOUND.indexOf(lastApi.error) >= 0) lastApi.notFound = true;
@@ -331,7 +398,8 @@
     if (item && item.historical_sold === undefined) {
       const alt = await getItem(`/api/v4/item/get?itemid=${r.product_id}&shopid=${r.shop_id}`);
       if (alt) {
-        ['historical_sold', 'sold', 'global_sold', 'historical_sold_display'].forEach(k => {
+        ['historical_sold', 'sold', 'global_sold', 'historical_sold_display',
+         'images', 'video_info_list', 'item_rating', 'cmt_count'].forEach(k => {
           if (alt[k] !== undefined && item[k] === undefined) item[k] = alt[k];
         });
       }
@@ -393,6 +461,49 @@
       r.sold_count = num(item.historical_sold ?? item.global_sold ?? item.sold);
       r.sold_band = item.historical_sold_display || (r.sold_count != null ? String(r.sold_count) : null);
       if (r.sold_count === null) r.warnings.push('shopee: API ไม่มี historical_sold — ตรวจ endpoint');
+
+      // ---- รูป / วิดีโอ / รีวิว ----
+      // ⚠️ ยังไม่ได้ยืนยันกับ API จริง: 2026-09-25 ทดสอบไม่ได้ (API ตอบ 90309999 เมื่อไม่มี cookie ล็อกอิน)
+      //    ชื่อ field ตาม item/get v4 + get_pc (product_images/product_review) — ถ้าหาไม่เจอจะเป็น null
+      //    พร้อม warning บอกคีย์ที่มีจริง ให้ดูรอบเก็บจริงครั้งแรกก่อนเอาไปคิดคะแนน
+      const pcImg = (apiData.find(d => d && d.product_images) || {}).product_images || null;
+      const pcRev = (apiData.find(d => d && d.product_review) || {}).product_review || null;
+      const IMG_HOST = 'https://down-th.img.susercontent.com/file/';
+
+      const imgs = (pcImg && Array.isArray(pcImg.images) && pcImg.images) || (Array.isArray(item.images) && item.images) || null;
+      if (imgs) {
+        r.images = imgs.filter(h => typeof h === 'string' && h).map(h => /^https?:|^\/\//.test(h) ? absUrl(h) : IMG_HOST + h);
+        r.image_count = r.images.length;
+      } else {
+        r.warnings.push('shopee: ไม่พบรายการรูป (images) — image_count เป็น null');
+      }
+
+      if (Array.isArray(item.video_info_list)) {
+        r.video_count = item.video_info_list.filter(Boolean).length;
+      } else if (pcImg && Array.isArray(pcImg.videos)) {
+        r.video_count = pcImg.videos.filter(Boolean).length;
+      } else if (pcImg && 'video' in pcImg) {
+        r.video_count = pcImg.video ? 1 : 0;
+      } else {
+        r.warnings.push('shopee: ไม่พบ field วิดีโอ — video_count เป็น null');
+      }
+
+      // item_rating.rating_count = [ทั้งหมด, 1★, 2★, 3★, 4★, 5★]
+      const ir = item.item_rating || pcRev || null;
+      if (ir) {
+        const rc = Array.isArray(ir.rating_count) ? ir.rating_count : null;
+        r.review_count = num(ir.total_rating_count ?? (rc && rc.length === 6 ? rc[0] : null) ?? ir.rating_total);
+        const avg = num(ir.rating_star);
+        r.rating = r.review_count ? avg : null;
+        const five = rc ? (rc.length === 6 ? rc.slice(1) : rc) : null;
+        r.rating_breakdown = starBreakdown(five, r.rating);
+        if (r.review_count === null && five && five.length === 5) {
+          const s = five.map(num).reduce((a, b) => a + (b || 0), 0);
+          r.review_count = s; r.rating = s ? avg : null;
+        }
+      } else {
+        r.warnings.push('shopee: ไม่พบ item_rating/product_review — rating เป็น null');
+      }
     } else if (lastApi.answered && lastApi.error != null) {
       // API ตอบ 200 แต่มี error code — ต้องแยกให้ออกว่า "สินค้าหาย" หรือ "โดนกัน"
       // ผิดพลาดแล้วราคาแพง: ถ้าตีว่าหายทั้งที่โดนกัน สินค้าที่ยังขายอยู่จะถูกทิ้งถาวร
@@ -563,6 +674,49 @@
         name: p.property_name,
         value: (p.property_values || []).map(v => v.property_value_name).filter(Boolean).join(', ')
       })).filter(x => x.name && x.value);
+
+      // ---- รูป / วิดีโอ / รีวิว ----
+      // ⚠️ ยังไม่ได้ยืนยันกับหน้าจริง: 2026-09-25 เบราว์เซอร์ที่ไม่ได้ผ่าน CAPTCHA เจอ Security Check
+      //    (ห้ามพยายามผ่านเอง) — ชื่อ field เป็นตัวเลือกที่น่าจะใช่ หาไม่เจอ = null + warning บอกคีย์ที่มีจริง
+      //    วิดีโอดูเฉพาะใน product_model เท่านั้น ห้าม deepFind ทั้งหน้า: หน้า TikTok มีคลิปครีเอเตอร์/ไลฟ์
+      //    ปนอยู่ ถ้านับรวมจะได้ว่าทุกหน้ามีวิดีโอ
+      const pick = (o, keys) => { const k = keys.find(x => o && o[x] !== undefined && o[x] !== null); return k ? o[k] : undefined; };
+      const keysLike = (o, re) => Object.keys(o || {}).filter(k => re.test(k)).join(',') || '-';
+
+      const imgArr = pick(pm, ['images', 'main_images', 'product_images', 'image_list']);
+      if (Array.isArray(imgArr)) {
+        r.images = imgArr.map(im => typeof im === 'string' ? absUrl(im)
+          : absUrl(im && ((Array.isArray(im.url_list) && im.url_list[0]) || im.url || im.thumb_url || im.uri)))
+          .filter(Boolean);
+        r.image_count = r.images.length;
+      } else {
+        r.warnings.push('tiktok: ไม่พบรายการรูปใน product_model (คีย์ที่มี: ' + keysLike(pm, /image|img|pic/i) + ')');
+      }
+
+      const VKEYS = ['video', 'product_video', 'videos', 'video_info', 'main_video'];
+      const vk = VKEYS.find(k => k in pm);
+      if (vk) {
+        const v = pm[vk];
+        r.video_count = Array.isArray(v) ? v.filter(Boolean).length : (v ? 1 : 0);
+      } else {
+        r.warnings.push('tiktok: ไม่พบ field วิดีโอใน product_model (คีย์ที่มี: ' + keysLike(pm, /video|vid/i) + ')');
+      }
+
+      // สรุปรีวิวระดับสินค้า — ค้นใน product_info ก่อน กันไปเจอคะแนนร้าน (ตัวที่มี shop_name ข้าม)
+      const RATE = ['product_overall_score', 'overall_score', 'product_rating', 'avg_rating', 'rating'];
+      const CNT = ['product_review_count', 'review_count', 'total_review_count', 'rating_count'];
+      const isRev = o => !o.shop_name && !o.seller_name
+        && RATE.some(k => num(o[k]) !== null) && CNT.some(k => num(o[k]) !== null);
+      let rvn = info ? deepFind(info, isRev, 6) : null;
+      if (!rvn) for (const root of roots) { rvn = deepFind(root, isRev); if (rvn) break; }
+      if (rvn) {
+        r.review_count = num(pick(rvn, CNT));
+        r.rating = r.review_count ? num(pick(rvn, RATE)) : null;
+        const dist = pick(rvn, ['star_distribution', 'rating_distribution', 'score_distribution']);
+        if (Array.isArray(dist)) r.rating_breakdown = starBreakdown(dist.map(x => (x && typeof x === 'object') ? (x.count ?? x.num) : x), r.rating);
+      } else {
+        r.warnings.push('tiktok: ไม่พบสรุปรีวิวสินค้า (คีย์ใน product_info: ' + keysLike(info, /review|rating|score/i) + ')');
+      }
     }
 
     if (!r.product_name) {
@@ -578,7 +732,7 @@
   const host = location.hostname;
   let promise;
   try {
-    if (/lazada\./.test(host))            promise = Promise.resolve(lazada());
+    if (/lazada\./.test(host))            promise = lazada();
     else if (/shopee\./.test(host))       promise = shopee();
     else if (/tiktok\.com|shop\.tiktok/.test(host)) promise = Promise.resolve(tiktok());
     else promise = Promise.resolve({ error: 'ไม่รู้จักโดเมนนี้: ' + host, url: location.href });
