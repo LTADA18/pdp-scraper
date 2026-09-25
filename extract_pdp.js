@@ -68,6 +68,20 @@
 
   const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
+  // คำอธิบายสินค้าเป็น HTML — แปลงเป็นข้อความโดยเก็บการขึ้นบรรทัดไว้ (ร้านมักเขียนสเปกเป็นรายการ)
+  // และคืนรูปในคำอธิบายแยกออกมา (หลายร้านใส่ตารางสเปกเป็นรูป)
+  const htmlToText = (html) => {
+    if (typeof html !== 'string' || !html.trim()) return { text: null, images: [] };
+    const images = [...html.matchAll(/<img[^>]+src\s*=\s*["']([^"']+)["']/gi)].map(m => absUrl(m[1])).filter(Boolean);
+    let s = html.replace(/<(br|\/p|\/li|\/div|\/h\d|\/tr)\b[^>]*>/gi, '\n').replace(/<li\b[^>]*>/gi, '• ')
+                .replace(/<[^>]+>/g, '');
+    try {
+      const ta = document.createElement('textarea'); ta.innerHTML = s; s = ta.value;   // ถอด &amp; &nbsp; ฯลฯ
+    } catch (e) { s = s.replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&'); }
+    const text = s.split('\n').map(x => x.replace(/[ \t ]+/g, ' ').trim()).filter(Boolean).join('\n');
+    return { text: text || null, images: [...new Set(images)] };
+  };
+
   // จำนวนรีวิวแยกดาว 5 ช่อง — แต่ละเว็บเรียงไม่เหมือนกัน (1→5 หรือ 5→1)
   // ไม่เดาลำดับ: ลองทั้งสองแบบ แล้วเลือกแบบที่คิดค่าเฉลี่ยออกมาใกล้คะแนนที่เว็บแสดง
   // ถ้าเว็บไม่ให้คะแนนเฉลี่ยมาเทียบ หรือทั้งสองแบบห่างเกิน 0.3 ดาว -> คืน null ไม่ใส่มั่ว
@@ -138,6 +152,8 @@
     rating: null,           // คะแนนเฉลี่ย 0–5 — ยังไม่มีรีวิวเลย = null ไม่ใช่ 0
     review_count: null,     // จำนวนเรตติ้งทั้งหมด
     rating_breakdown: null, // {5: n, 4: n, 3: n, 2: n, 1: n}
+    description: null,      // ข้อความคำอธิบายสินค้า (ตัด HTML แล้ว เก็บการขึ้นบรรทัด) — ไม่พบ = null
+    description_images: [], // รูปในคำอธิบาย (บางร้านใส่ตารางสเปกเป็นรูป)
     source: null,           // state | api | jsonld | dom
     scraped_at: new Date().toISOString(),
     warnings: []
@@ -287,6 +303,15 @@
         r.warnings.push('lazada: ไม่พบ skuGalleries — images/video_count เป็น null');
       }
 
+      // ---- คำอธิบาย: product.desc (HTML) + highlights (จุดเด่นแบบรายการ) — มากับ SSR ไม่ต้องรอ ----
+      if (f.product && (f.product.desc || f.product.highlights)) {
+        const hl = htmlToText(f.product.highlights), ds = htmlToText(f.product.desc);
+        r.description = [hl.text, ds.text].filter(Boolean).join('\n\n') || null;
+        r.description_images = [...new Set([...hl.images, ...ds.images])];
+      } else {
+        r.warnings.push('lazada: ไม่พบคำอธิบายสินค้า (product.desc) — description เป็น null');
+      }
+
       // ---- รีวิว: {averageRating, reviews, scores:[5★..1★]} (ยืนยัน 2026-09-25: [72,2,0,1,1] เฉลี่ย 4.9) ----
       const rv = f.review || null;
       if (rv && (rv.averageRating !== undefined || rv.reviews !== undefined)) {
@@ -399,7 +424,7 @@
       const alt = await getItem(`/api/v4/item/get?itemid=${r.product_id}&shopid=${r.shop_id}`);
       if (alt) {
         ['historical_sold', 'sold', 'global_sold', 'historical_sold_display',
-         'images', 'video_info_list', 'item_rating', 'cmt_count'].forEach(k => {
+         'images', 'video_info_list', 'item_rating', 'cmt_count', 'description', 'rich_text_description'].forEach(k => {
           if (alt[k] !== undefined && item[k] === undefined) item[k] = alt[k];
         });
       }
@@ -486,6 +511,18 @@
         r.video_count = pcImg.video ? 1 : 0;
       } else {
         r.warnings.push('shopee: ไม่พบ field วิดีโอ — video_count เป็น null');
+      }
+
+      // คำอธิบาย: item/get มี description เป็นข้อความล้วน (มีขึ้นบรรทัด) — ⚠️ ยังไม่ได้ยืนยันกับ API จริง
+      const pcDesc = (apiData.find(d => d && d.product_description) || {}).product_description || null;
+      if (typeof item.description === 'string' && item.description.trim()) {
+        r.description = item.description.trim();
+      } else if (pcDesc && Array.isArray(pcDesc.paragraph_list)) {
+        // get_pc: [{type:1 ข้อความ, text} | {type:2 รูป, img_id}] (ชื่อ field ตามที่คาด ต้องตรวจรอบแรก)
+        r.description = pcDesc.paragraph_list.filter(p => p && p.text).map(p => String(p.text).trim()).join('\n') || null;
+        r.description_images = pcDesc.paragraph_list.filter(p => p && p.img_id).map(p => IMG_HOST + p.img_id);
+      } else {
+        r.warnings.push('shopee: ไม่พบคำอธิบายสินค้า — description เป็น null');
       }
 
       // item_rating.rating_count = [ทั้งหมด, 1★, 2★, 3★, 4★, 5★]
@@ -700,6 +737,25 @@
         r.video_count = Array.isArray(v) ? v.filter(Boolean).length : (v ? 1 : 0);
       } else {
         r.warnings.push('tiktok: ไม่พบ field วิดีโอใน product_model (คีย์ที่มี: ' + keysLike(pm, /video|vid/i) + ')');
+      }
+
+      // คำอธิบาย — ⚠️ ยังไม่ได้ยืนยันกับหน้าจริง: TikTok มักเก็บเป็น JSON string ของ rich text
+      //   [{type:"text", text} | {type:"image", image:{url_list}}] หรือเป็น HTML/ข้อความล้วน รองรับทั้งสามแบบ
+      const rawDesc = pick(pm, ['description', 'desc', 'product_description', 'desc_detail']);
+      if (typeof rawDesc === 'string' && rawDesc.trim()) {
+        let blocks = null;
+        try { const j = JSON.parse(rawDesc); if (Array.isArray(j)) blocks = j; } catch (e) { /* ไม่ใช่ JSON */ }
+        if (blocks) {
+          r.description = blocks.filter(b => b && typeof b.text === 'string').map(b => b.text.trim()).filter(Boolean).join('\n') || null;
+          r.description_images = blocks.map(b => b && b.image && absUrl((Array.isArray(b.image.url_list) && b.image.url_list[0]) || b.image.url))
+            .filter(Boolean);
+        } else if (/<[a-z][^>]*>/i.test(rawDesc)) {
+          const h = htmlToText(rawDesc); r.description = h.text; r.description_images = h.images;
+        } else {
+          r.description = rawDesc.trim();
+        }
+      } else {
+        r.warnings.push('tiktok: ไม่พบคำอธิบายใน product_model (คีย์ที่มี: ' + keysLike(pm, /desc/i) + ')');
       }
 
       // สรุปรีวิวระดับสินค้า — ค้นใน product_info ก่อน กันไปเจอคะแนนร้าน (ตัวที่มี shop_name ข้าม)
