@@ -120,11 +120,20 @@ async def open_pdp(page, url, delay):
     return rec
 
 
-async def search_rank(page, query, pid, delay):
-    """ค้น query บน Lazada แล้วหาอันดับของสินค้านี้ในหน้าแรก (40 การ์ด)"""
-    j = await ajax(page, f"/catalog/?ajax=true&page=1&q={urllib.parse.quote(query)}")
-    await page.wait_for_timeout(int(delay * 1000))
-    items = items_of(j)
+async def search_rank(page, query, pid, delay, qcache=None):
+    """ค้น query บน Lazada แล้วหาอันดับของสินค้านี้ในหน้าแรก (40 การ์ด)
+
+    qcache: ตรวจทั้งร้าน สินค้าหลายหน้าเป็นรุ่นเดียวกัน (ต่างแค่ชุด/ตัวเลือก) ค้นคำเดียวกันซ้ำ
+    เก็บผลค้นไว้ใช้ซ้ำในรอบเดียวกัน — ยิงคำขอน้อยลง เร็วขึ้น และเสี่ยงโดน CAPTCHA น้อยลง
+    """
+    if qcache is not None and query in qcache:
+        items = qcache[query]
+    else:
+        j = await ajax(page, f"/catalog/?ajax=true&page=1&q={urllib.parse.quote(query)}")
+        await page.wait_for_timeout(int(delay * 1000))
+        items = items_of(j)
+        if qcache is not None:
+            qcache[query] = items
     pos = next((i + 1 for i, it in enumerate(items) if str(it.get("nid") or it.get("itemId")) == str(pid)), None)
     return items, pos
 
@@ -190,7 +199,7 @@ def result_doc(rec, card, pos, med, query, cover_white, sc, req_id):
     }
 
 
-async def deep_one(page, url, ref, req_id, delay, out, stamp, shop_id=None, with_images=True):
+async def deep_one(page, url, ref, req_id, delay, out, stamp, shop_id=None, with_images=True, qcache=None):
     rec = await open_pdp(page, url, delay)
     if not rec.get("product_name"):
         raise RuntimeError("เปิดหน้าสินค้าแล้วอ่านข้อมูลไม่ได้: " + "; ".join(rec.get("warnings") or [])[:200])
@@ -199,7 +208,7 @@ async def deep_one(page, url, ref, req_id, delay, out, stamp, shop_id=None, with
     toks = [tok for tok, _, ok in tm if ok] or [tok for tok, _, _ in tm]
     m0 = re.match(r"[A-Z]{2,6}(?:-?[A-Z]{1,3})?-?\d{2,4}", toks[0]) if toks else None
     query = m0.group(0) if m0 else " ".join((rec.get("product_name") or "").split()[:3])   # ค้นด้วยรหัสฐาน เช่น OCHD802
-    items, pos = await search_rank(page, query, pid, delay)
+    items, pos = await search_rank(page, query, pid, delay, qcache)
     med = R.page_medians(items) if items else {"disc": 0, "review": 0, "sold": 0, "n": 0}
     card = next((it for it in items if str(it.get("nid") or it.get("itemId")) == pid), None)
     if card is None:          # ไม่ติดหน้าแรก — ใช้ข้อมูลหน้าสินค้าแทนการ์ด (ข้อที่ไม่มีข้อมูลจะถูกข้าม)
@@ -252,6 +261,32 @@ async def deep_one(page, url, ref, req_id, delay, out, stamp, shop_id=None, with
         "search_pos": pos, "search_query": query, "cover": cover,
         "shop_id": shop_id, "request_id": req_id, "scraped_at": doc["scraped_at"]}))
     return rid, doc, files
+
+
+def resumable(out, hours):
+    """ผลที่รอบก่อนของคำขอเดียวกันตรวจไว้แล้ว (ภายใน hours ชม.) -> {pid: (rid, doc, files)}
+
+    รอบตรวจทั้งร้านยาวหลายสิบนาที ล้มกลางทางได้ (CAPTCHA / เน็ตหลุด / หน้าต่าง Chrome ถูกปิด)
+    ของเดิมเริ่มใหม่หมดทุกครั้ง — TNL 186 หน้า ล้ม 2 รอบติดที่ 101 และ 20 หน้า เสียงานไปเปล่า ๆ
+    ไฟล์ผลเขียนลงดิสก์ทีละหน้าอยู่แล้ว รอบถัดไปจึงหยิบมาใช้ต่อแล้วตรวจเฉพาะหน้าที่ยังขาด
+    """
+    got, cutoff = {}, time.time() - hours * 3600
+    for p in sorted(out.glob("results__lzd-*.json")):
+        if "__imgs__" in p.name or p.stat().st_mtime < cutoff:
+            continue
+        rid = p.stem[len("results__"):]
+        card = out / f"cards__{rid}.json"
+        if not card.exists():                  # เขียนไม่จบ (การ์ดเขียนเป็นไฟล์สุดท้ายของหน้า)
+            continue
+        doc = json.loads(p.read_text(encoding="utf-8"))
+        pid = rid.split("-")[1]
+        files = [{"collection": "results", "doc_id": rid, "file": str(p)}]
+        for ip in sorted(out.glob(f"results__{rid}__imgs__*.json")):
+            files.append({"collection": f"results/{rid}/imgs", "doc_id": ip.stem.rsplit("__", 1)[1], "file": str(ip)})
+        files.append({"collection": "cards", "doc_id": rid, "file": str(card)})
+        if pid not in got or rid > got[pid][0]:          # ตรวจหลายรอบ เอาอันล่าสุด
+            got[pid] = (rid, doc, files)
+    return got
 
 
 def write(out, collection, doc_id, data):
@@ -328,11 +363,25 @@ async def run(a):
                 sid = f"lzd-{slug}-{stamp}"
                 # ตรวจละเอียดทุกหน้า (ได้คะแนนเต็มครบ) · เก็บรูปเฉพาะ --max หน้าที่ขายดีสุด
                 deep = sorted(rows, key=lambda r: -r["sold_n"])[:a.max_deep]
-                net_fail = 0
+                done_before = resumable(out, a.resume_hours)
+                if done_before:
+                    print(f"  ทำต่อจากรอบก่อน: ตรวจไว้แล้ว {sum(1 for r in deep if r['id'] in done_before)}/{len(deep)} หน้า", flush=True)
+                net_fail, qcache = 0, {}
                 for n_done, r in enumerate(deep):
                     try:
+                        if r["id"] in done_before:
+                            rid, doc, files = done_before[r["id"]]
+                            # การ์ดเดิมผูกกับ shop_id ของรอบก่อน — ชี้มารอบนี้ ไม่งั้นหน้าเว็บจัดกลุ่มผิดร้าน
+                            cp = Path(files[-1]["file"])
+                            c = json.loads(cp.read_text(encoding="utf-8"))
+                            c["shop_id"] = sid
+                            cp.write_text(json.dumps(c, ensure_ascii=False), encoding="utf-8")
+                            manifest += files
+                            r["result_id"], r["total"] = rid, doc["total"]
+                            results.append({"id": rid, "total": doc["total"], "title": doc["title"]})
+                            continue
                         rid, doc, files = await deep_one(page, r["url"], ref, req_id, a.delay, out, stamp, sid,
-                                                         with_images=n_done < a.max)
+                                                         with_images=n_done < a.max, qcache=qcache)
                         print(f"  [{n_done + 1}/{len(deep)}] {doc['total']} {doc['title'][:40]}", flush=True)
                         manifest += files
                         r["result_id"], r["total"] = rid, doc["total"]
@@ -404,6 +453,8 @@ def main():
     ap.add_argument("--max-pages", type=int, default=8, help="หน้ารายการในร้านสูงสุด (40 ชิ้น/หน้า)")
     ap.add_argument("--cdp", default="http://localhost:9222")
     ap.add_argument("--delay", type=float, default=4.0)
+    ap.add_argument("--resume-hours", type=float, default=36,
+                    help="ใช้ผลที่รอบก่อนของคำขอเดียวกันตรวจไว้แล้ว ถ้าไม่เก่ากว่านี้ (ชม.) — 0 = ตรวจใหม่หมด")
     ap.add_argument("--request-id")
     ap.add_argument("--out", default=str(HERE / "output" / "scorecard"))
     a = ap.parse_args()
