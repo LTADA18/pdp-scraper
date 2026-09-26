@@ -41,7 +41,36 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 
 class Blocked(Exception):
-    """Lazada ตอบหน้า anti-bot/CAPTCHA — หยุดทั้งงาน ให้คนผ่านเอง"""
+    """Lazada ตอบหน้า anti-bot/CAPTCHA แล้วไม่มีคนกดผ่านภายในเวลารอ — หยุดทั้งงาน"""
+
+
+# นาทีที่รอให้คนกดผ่าน CAPTCHA ในหน้าต่าง Chrome ก่อนยอมแพ้ (ตั้งจาก --captcha-wait · 0 = หยุดทันที)
+CAPTCHA_WAIT = 0.0
+
+
+async def wait_for_human(page, why, still_blocked):
+    """ขึ้น CAPTCHA — ⛔ ไม่พยายามผ่านเอง ดึงแท็บขึ้นหน้าสุดแล้วรอคนกดในหน้าต่าง Chrome
+
+    ของเดิมหยุดทั้งรอบทันที ต้องสั่งใหม่ทุกครั้ง (TNL 186 หน้าโดน 3 รอบ) เจ้าของงานเลือกให้
+    ตรวจรวดเดียวแล้วกดผ่านเองเมื่อขึ้น (2026-09-26) — ตรวจทุก 15 วิว่าผ่านแล้วหรือยัง แล้วทำต่อ
+    """
+    if CAPTCHA_WAIT <= 0:
+        raise Blocked(why)
+    print(f"  ⏸ CAPTCHA — รอคนกดผ่านในหน้าต่าง Chrome (สูงสุด {CAPTCHA_WAIT:g} นาที)", flush=True)
+    try:
+        await page.bring_to_front()
+    except Exception:  # noqa: BLE001
+        pass
+    deadline = time.time() + CAPTCHA_WAIT * 60
+    while time.time() < deadline:
+        await page.wait_for_timeout(15000)
+        try:
+            if not await still_blocked():
+                print("  ▶ ผ่าน CAPTCHA แล้ว ทำต่อ", flush=True)
+                return
+        except Exception:  # noqa: BLE001   หน้ากำลังเปลี่ยน (คนกดแล้ว redirect) — รอบหน้าเช็คใหม่
+            pass
+    raise Blocked(f"{why} (รอ {CAPTCHA_WAIT:g} นาทีแล้วยังไม่มีคนกดผ่าน)")
 
 
 def now():
@@ -78,15 +107,28 @@ def img_uri(url, size):
 
 # ---------------------------------------------------------------- Lazada
 
+AJAX_JS = """async (p) => {
+    const r = await fetch(p, {credentials: 'include'});
+    const t = await r.text();
+    try { return {ok: true, j: JSON.parse(t)}; } catch (e) { return {ok: false, head: t.slice(0, 300)}; }
+}"""
+PUNISH = re.compile(r"punish|captcha|x5sec|baxia", re.I)
+
+
 async def ajax(page, path):
-    """GET JSON แบบ same-origin จากแท็บ Lazada — ได้ HTML/punish = Blocked"""
-    res = await page.evaluate("""async (p) => {
-        const r = await fetch(p, {credentials: 'include'});
-        const t = await r.text();
-        try { return {ok: true, j: JSON.parse(t)}; } catch (e) { return {ok: false, head: t.slice(0, 300)}; }
-    }""", path)
+    """GET JSON แบบ same-origin จากแท็บ Lazada — ได้หน้า punish = รอคนกดผ่าน CAPTCHA"""
+    res = await page.evaluate(AJAX_JS, path)
+    if not res["ok"] and PUNISH.search(res["head"]):
+        # fetch เบื้องหลังคนมองไม่เห็น CAPTCHA — เปิด URL เดียวกันในแท็บให้หน้ายืนยันขึ้นมาให้กด
+        await page.goto(BASE + path, wait_until="domcontentloaded", timeout=60000)
+
+        async def still():
+            r = await page.evaluate(AJAX_JS, path)
+            return not r["ok"] and bool(PUNISH.search(r["head"]))
+        await wait_for_human(page, "Lazada ขึ้นหน้ายืนยันตัวตน (CAPTCHA) — กดผ่านในหน้าต่าง Chrome ที่เปิดไว้ แล้วสั่งใหม่", still)
+        res = await page.evaluate(AJAX_JS, path)
     if not res["ok"]:
-        if re.search(r"punish|captcha|x5sec|baxia", res["head"], re.I):
+        if PUNISH.search(res["head"]):
             raise Blocked("Lazada ขึ้นหน้ายืนยันตัวตน (CAPTCHA) — กดผ่านในหน้าต่าง Chrome ที่เปิดไว้ แล้วสั่งใหม่")
         return None
     return res["j"]
@@ -110,14 +152,26 @@ def items_of(j):
     return ((j or {}).get("mods") or {}).get("listItems") or []
 
 
+def pdp_captcha(rec):
+    return rec.get("source") == "blocked" and any("CAPTCHA" in w or "ยืนยัน" in w for w in rec.get("warnings") or [])
+
+
 async def open_pdp(page, url, delay):
-    await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    await page.wait_for_timeout(2500)
-    rec = await page.evaluate(JS)
-    await page.wait_for_timeout(int(delay * 1000))
-    if rec.get("source") == "blocked" and any("CAPTCHA" in w or "ยืนยัน" in w for w in rec.get("warnings") or []):
-        raise Blocked("หน้าสินค้าขึ้น CAPTCHA — กดผ่านในหน้าต่าง Chrome ที่เปิดไว้ แล้วสั่งใหม่")
-    return rec
+    why = "หน้าสินค้าขึ้น CAPTCHA — กดผ่านในหน้าต่าง Chrome ที่เปิดไว้ แล้วสั่งใหม่"
+    for attempt in range(2):
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        await page.wait_for_timeout(2500)
+        rec = await page.evaluate(JS)
+        await page.wait_for_timeout(int(delay * 1000))
+        if not pdp_captcha(rec):
+            return rec
+        if attempt == 0:          # รอคนกด แล้วเปิดหน้าสินค้าใหม่อีกครั้ง
+            await wait_for_human(page, why, lambda: _pdp_still(page))
+    raise Blocked(why)
+
+
+async def _pdp_still(page):
+    return pdp_captcha(await page.evaluate(JS))
 
 
 async def search_rank(page, query, pid, delay, qcache=None):
@@ -366,8 +420,14 @@ async def run(a):
                 done_before = resumable(out, a.resume_hours)
                 if done_before:
                     print(f"  ทำต่อจากรอบก่อน: ตรวจไว้แล้ว {sum(1 for r in deep if r['id'] in done_before)}/{len(deep)} หน้า", flush=True)
-                net_fail, qcache = 0, {}
+                net_fail, qcache, n_new = 0, {}, 0
                 for n_done, r in enumerate(deep):
+                    if a.max_new and n_new >= a.max_new and r["id"] not in done_before:
+                        # ครบโควตารอบนี้ — พักให้ Lazada ไม่ขึ้น CAPTCHA ผลที่ได้อยู่บนดิสก์ รอบหน้าทำต่อ
+                        left = sum(1 for x in deep[n_done:] if x["id"] not in done_before)
+                        summary.update(status="partial", kind="shop", progress_done=len(deep) - left, progress_total=len(deep),
+                                       note=f"ตรวจแล้ว {len(deep) - left}/{len(deep)} หน้า — รอบละ {a.max_new} หน้ากันโดน CAPTCHA รอบถัดไปทำต่อเอง")
+                        return finish(out, manifest, summary)
                     try:
                         if r["id"] in done_before:
                             rid, doc, files = done_before[r["id"]]
@@ -380,6 +440,7 @@ async def run(a):
                             r["result_id"], r["total"] = rid, doc["total"]
                             results.append({"id": rid, "total": doc["total"], "title": doc["title"]})
                             continue
+                        n_new += 1
                         rid, doc, files = await deep_one(page, r["url"], ref, req_id, a.delay, out, stamp, sid,
                                                          with_images=n_done < a.max, qcache=qcache)
                         print(f"  [{n_done + 1}/{len(deep)}] {doc['total']} {doc['title'][:40]}", flush=True)
@@ -440,10 +501,11 @@ def finish(out, manifest, summary):
     for r in summary.get("results") or []:
         print("  ", r)
     print("manifest:", out / "manifest.json", f"({len(manifest)} docs)")
-    return 0 if summary.get("status") == "done" else 1
+    return {"done": 0, "partial": 3}.get(summary.get("status"), 1)     # 3 = ครบโควตารอบ ยังไม่จบร้าน
 
 
 def main():
+    sys.stdout.reconfigure(encoding="utf-8")      # log มีภาษาไทย/⏸ — ถูก redirect แล้ว cp1252 ทำตายกลางรอบ
     ap = argparse.ArgumentParser(description="Lazada Listing Scorecard")
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--url", nargs="+", help="ลิงก์หน้าสินค้า Lazada (หลายลิงก์ได้)")
@@ -453,13 +515,20 @@ def main():
     ap.add_argument("--max-pages", type=int, default=8, help="หน้ารายการในร้านสูงสุด (40 ชิ้น/หน้า)")
     ap.add_argument("--cdp", default="http://localhost:9222")
     ap.add_argument("--delay", type=float, default=4.0)
-    ap.add_argument("--resume-hours", type=float, default=36,
+    ap.add_argument("--captcha-wait", type=float, default=20,
+                    help="ขึ้น CAPTCHA แล้วรอคนกดผ่านในหน้าต่าง Chrome กี่นาที ก่อนหยุด (0 = หยุดทันที)")
+    ap.add_argument("--max-new", type=int, default=0,
+                    help="ตรวจทั้งร้าน: เปิดหน้าสินค้าใหม่ได้รอบละกี่หน้า แล้วหยุดเป็น partial ให้รอบหน้าทำต่อ "
+                         "(Lazada ขึ้น CAPTCHA หลังเปิดราว 30–100 หน้าติดกัน) — 0 = ไม่จำกัด")
+    ap.add_argument("--resume-hours", type=float, default=96,
                     help="ใช้ผลที่รอบก่อนของคำขอเดียวกันตรวจไว้แล้ว ถ้าไม่เก่ากว่านี้ (ชม.) — 0 = ตรวจใหม่หมด")
     ap.add_argument("--request-id")
     ap.add_argument("--out", default=str(HERE / "output" / "scorecard"))
     a = ap.parse_args()
     if a.delay < 3:
         ap.error("--delay ห้ามต่ำกว่า 3 วินาที (กฎเหล็กข้อ 3)")
+    global CAPTCHA_WAIT
+    CAPTCHA_WAIT = a.captcha_wait
     sys.exit(asyncio.run(run(a)))
 
 
